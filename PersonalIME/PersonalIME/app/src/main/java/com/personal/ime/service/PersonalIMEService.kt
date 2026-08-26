@@ -247,7 +247,7 @@ class PersonalIMEService : InputMethodService() {
         row4.addView(createSpecialKey("空格", { handleSpace() }, weight = 2.2f))
         row4.addView(createSpecialKey(".", { commitPlainText(".") }, weight = 0.8f))
         row4.addView(createSpecialKey("换行", ::handleEnter, weight = 0.9f))
-        row4.addView(createSpecialKey(if (tempEnglish) "英/中" else "英", ::toggleInputMode, weight = 0.9f))
+        row4.addView(createSpecialKey(if (tempEnglish) "英" else "英/中", ::toggleInputMode, weight = 0.9f))
         container.addView(row4)
     }
 
