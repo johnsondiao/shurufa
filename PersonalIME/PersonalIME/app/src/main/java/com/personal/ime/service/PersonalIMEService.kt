@@ -133,7 +133,7 @@ class PersonalIMEService : InputMethodService() {
         // Row 4: ? | 0 | 空格 | 中/英
         val row4 = createKeyboardRow()
         row4.addView(createNarrowKey("？", { commitPlainText("？") }))
-        row4.addView(createT9Key("0", '0', ::handleT9Key))
+        row4.addView(createT9Key("0", '0') { commitPlainText("0") })
         row4.addView(createSpecialKey("空格", { handleSpace() }, weight = 2f))
         row4.addView(createSpecialKey(modeLabel(), ::toggleInputMode))
         container.addView(row4)
@@ -171,7 +171,7 @@ class PersonalIMEService : InputMethodService() {
             }
             // 右列
             when (row) {
-                0 -> rowView.addView(createSpecialKey("", ::handleDelete))
+                0 -> rowView.addView(createSpecialKey("⌫", ::handleDelete))
                 1 -> rowView.addView(createSpecialKey(if (symbolPage == 1) "2/2" else "1/2", ::toggleSymbolPage))
                 2 -> rowView.addView(createSpecialKey("返回", ::backToT9))
             }
@@ -253,11 +253,12 @@ class PersonalIMEService : InputMethodService() {
     // ==================== 按键工厂 ====================
 
     private fun createKeyboardRow(): LinearLayout {
+        val rowHeightPx = (48 * resources.displayMetrics.density).toInt()
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                48 // 固定行高
+                rowHeightPx
             )
         }
     }
