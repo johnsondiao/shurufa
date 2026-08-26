@@ -87,7 +87,7 @@ class PersonalIMEService : InputMethodService() {
     private fun buildT9Keyboard(container: LinearLayout) {
         // Row 1: 1 (.), 2 (abc), 3 (def)
         val row1 = createKeyboardRow()
-        row1.addView(createT9Key("1", ".", listOf(".", ",", "!", "?")))
+        row1.addView(createT9Key("1", ".", listOf('.', ',', '!', '?')))
         row1.addView(createT9Key("2", "abc", listOf('2')))
         row1.addView(createT9Key("3", "def", listOf('3')))
         container.addView(row1)
@@ -162,6 +162,7 @@ class PersonalIMEService : InputMethodService() {
         }
     }
 
+    @Suppress("UNUSED_PARAMETER")
     private fun createT9Key(digit: String, letters: String, digits: List<Char>): View {
         return Button(this).apply {
             text = "$digit\n$letters"
