@@ -209,7 +209,7 @@ class PersonalIMEService : InputMethodService() {
         feedbackManager.playSound(soundVolume)
 
         currentInput += digit
-        updateComposingText()
+        // T9 模式不显示数字，只更新候选栏
         updateCandidates()
     }
 
