@@ -273,4 +273,26 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
         }
         db.insertWithOnConflict(TABLE_WORDS, null, values, SQLiteDatabase.CONFLICT_REPLACE)
     }
+
+    /**
+     * 学习英文单词：已存在则词频 +1，否则新建记录。
+     * 仅接受纯英文字母的单词，避免中文拼音词条被误写。
+     */
+    fun learnEnglishWord(word: String) {
+        val lower = word.lowercase()
+        if (lower.isEmpty() || !lower.all { it in 'a'..'z' }) return
+
+        val db = writableDatabase
+        db.execSQL(
+            "UPDATE $TABLE_WORDS SET $COL_FREQ = $COL_FREQ + 1 WHERE $COL_PINYIN = ? AND $COL_WORD = ?",
+            arrayOf(lower, word)
+        )
+        val values = ContentValues().apply {
+            put(COL_PINYIN, lower)
+            put(COL_WORD, word)
+            put(COL_FREQ, 1)
+        }
+        // 已存在时忽略，避免覆盖刚更新的词频
+        db.insertWithOnConflict(TABLE_WORDS, null, values, SQLiteDatabase.CONFLICT_IGNORE)
+    }
 }
