@@ -257,8 +257,8 @@ class PersonalIMEService : InputMethodService() {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { weight = 1f }
+                48 // 固定行高
+            )
         }
     }
 
