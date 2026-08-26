@@ -39,6 +39,9 @@ class PersonalIMEService : InputMethodService() {
     private var vibrationStrength = 30
     private var soundVolume = 20
 
+    /** 临时英文模式：中文输入中点“英”切到 26 键，英文单词上屏后自动回到 9 键 */
+    private var tempEnglish = false
+
     private var keyboardContainer: LinearLayout? = null
     private var candidateLayout: LinearLayout? = null
     private var shiftKey: Button? = null
@@ -135,12 +138,13 @@ class PersonalIMEService : InputMethodService() {
         row3.addView(createSpecialKey("换行", ::handleEnter))
         container.addView(row3)
 
-        // Row 4: ？ | 符号  123  空格  中/英（填满整行，无空白占位）
+        // Row 4: ？ | 符号  123  空格  英  中/英（填满整行）
         val row4 = createKeyboardRow()
         row4.addView(createNarrowKey("？", { commitPlainText("？") }))
         row4.addView(createSpecialKey("符号", ::showSymbols))
         row4.addView(createSpecialKey("123", ::showNumbers))
         row4.addView(createSpecialKey("空格", { handleSpace() }, weight = 2f))
+        row4.addView(createSpecialKey("英", ::switchToEnglishTemp, weight = 0.8f))
         row4.addView(createSpecialKey(modeLabel(), ::toggleInputMode))
         container.addView(row4)
     }
@@ -238,11 +242,12 @@ class PersonalIMEService : InputMethodService() {
         container.addView(row3)
 
         val row4 = createKeyboardRow()
-        row4.addView(createSpecialKey("中文", ::toggleInputMode))
-        row4.addView(createSpecialKey(",", { commitPlainText(",") }))
-        row4.addView(createSpecialKey("空格", { handleSpace() }, weight = 2.5f))
-        row4.addView(createSpecialKey(".", { commitPlainText(".") }))
-        row4.addView(createSpecialKey("↵", ::handleEnter))
+        row4.addView(createSpecialKey("中", ::backToChinese, weight = 0.8f))
+        row4.addView(createSpecialKey(",", { commitPlainText(",") }, weight = 0.8f))
+        row4.addView(createSpecialKey("空格", { handleSpace() }, weight = 2.2f))
+        row4.addView(createSpecialKey(".", { commitPlainText(".") }, weight = 0.8f))
+        row4.addView(createSpecialKey("换行", ::handleEnter, weight = 0.9f))
+        row4.addView(createSpecialKey(if (tempEnglish) "英/中" else "英", ::toggleInputMode, weight = 0.9f))
         container.addView(row4)
     }
 
@@ -373,7 +378,7 @@ class PersonalIMEService : InputMethodService() {
         updateCandidates()
     }
 
-    /** 中/英切换 */
+    /** 中/英切换（正式模式切换；临时英文下按此键转为正式英文模式） */
     private fun toggleInputMode() {
         feedbackManager.vibrate(vibrationStrength)
         feedbackManager.playSound(soundVolume)
@@ -381,7 +386,43 @@ class PersonalIMEService : InputMethodService() {
             currentInput = ""
             currentInputConnection?.finishComposingText()
         }
-        inputMode = if (inputMode == InputMode.CHINESE_T9) InputMode.ENGLISH_QWERTY else InputMode.CHINESE_T9
+        if (tempEnglish) {
+            // 临时英文 → 正式英文模式（留在 26 键）
+            tempEnglish = false
+        } else {
+            inputMode = if (inputMode == InputMode.CHINESE_T9) InputMode.ENGLISH_QWERTY else InputMode.CHINESE_T9
+        }
+        keyboardPage = KeyboardPage.T9
+        isShifted = false
+        rebuildKeyboard()
+        updateCandidates()
+    }
+
+    /** 中文输入中临时切到 26 键英文，英文单词上屏后自动返回 9 键 */
+    private fun switchToEnglishTemp() {
+        feedbackManager.vibrate(vibrationStrength)
+        feedbackManager.playSound(soundVolume)
+        if (currentInput.isNotEmpty()) {
+            flushT9Pending()
+        }
+        inputMode = InputMode.ENGLISH_QWERTY
+        tempEnglish = true
+        keyboardPage = KeyboardPage.T9
+        isShifted = false
+        rebuildKeyboard()
+        updateCandidates()
+    }
+
+    /** 从 26 键手动回到中文 9 键 */
+    private fun backToChinese() {
+        feedbackManager.vibrate(vibrationStrength)
+        feedbackManager.playSound(soundVolume)
+        if (currentInput.isNotEmpty()) {
+            currentInput = ""
+            currentInputConnection?.finishComposingText()
+        }
+        inputMode = InputMode.CHINESE_T9
+        tempEnglish = false
         keyboardPage = KeyboardPage.T9
         isShifted = false
         rebuildKeyboard()
@@ -447,10 +488,12 @@ class PersonalIMEService : InputMethodService() {
             // 中文：空格上屏首选候选；无候选时静默丢弃数字，绝不上屏原始数字
             flushT9Pending()
         } else {
+            // 英文：已输入的是完整单词则原样上屏，否则采用首选预测自动补全；
+            // 临时英文模式下屏后自动回到 9 键中文，方便中英混输
             val predictions = englishEngine.predict(currentInput)
             val isKnownWord = predictions.any { it.equals(currentInput, ignoreCase = true) }
             val commit = if (isKnownWord || predictions.isEmpty()) currentInput else predictions.first()
-            commitEnglishText(applyInputCase(commit))
+            commitEnglishWithAutoBack(applyInputCase(commit))
         }
     }
 
@@ -461,7 +504,7 @@ class PersonalIMEService : InputMethodService() {
             if (inputMode == InputMode.CHINESE_T9) {
                 flushT9Pending()
             } else {
-                commitTextDirectly(currentInput)
+                commitEnglishWithAutoBack(currentInput)
             }
         } else {
             sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
@@ -491,7 +534,7 @@ class PersonalIMEService : InputMethodService() {
             if (inputMode == InputMode.CHINESE_T9) {
                 flushT9Pending()
             } else {
-                commitEnglishText(currentInput)
+                commitEnglishWithAutoBack(currentInput)
             }
         }
         currentInputConnection?.commitText(text, 1)
@@ -518,7 +561,7 @@ class PersonalIMEService : InputMethodService() {
             englishEngine.predict(currentInput).take(10).forEach { word ->
                 val display = applyInputCase(word)
                 candidatesView.addView(
-                    createCandidateView(display) { commitEnglishText(display) }
+                    createCandidateView(display) { commitEnglishWithAutoBack(display) }
                 )
             }
         }
@@ -538,12 +581,6 @@ class PersonalIMEService : InputMethodService() {
         return if (first.isUpperCase()) word.replaceFirstChar { it.uppercase() } else word
     }
 
-    private fun commitTextDirectly(text: String) {
-        currentInputConnection?.commitText(text, 1)
-        currentInput = ""
-        updateCandidates()
-    }
-
     private fun commitCandidate(candidate: PinyinEngine.Candidate) {
         currentInputConnection?.commitText(candidate.text, 1)
         if (!isPrivacyMode) {
@@ -560,6 +597,17 @@ class PersonalIMEService : InputMethodService() {
         }
         currentInput = ""
         updateCandidates()
+    }
+
+    /** 上屏英文单词；若处于临时英文模式，上屏后自动回到 9 键中文 */
+    private fun commitEnglishWithAutoBack(text: String) {
+        commitEnglishText(text)
+        if (tempEnglish) {
+            tempEnglish = false
+            inputMode = InputMode.CHINESE_T9
+            keyboardPage = KeyboardPage.T9
+            rebuildKeyboard()
+        }
     }
 
     /** 根据当前输入模式返回切换键标签 */
