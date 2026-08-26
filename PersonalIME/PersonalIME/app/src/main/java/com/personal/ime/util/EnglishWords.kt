@@ -342,5 +342,52 @@ object EnglishWords {
         usability funnel retention churn
         resume interview candidate recruiter salary bonus promotion teammate
         colleague mentor jargon buzzword
+        ls cd pwd cp mv rm mkdir rmdir touch cat less more head tail locate
+        which whereis whoami who hostname uname uptime free df du htop pkill
+        killall jobs bg fg nohup screen tmux sudo su passwd chgrp umask ln
+        gunzip bzip2 xz rsync sftp ssh curl wget ping traceroute tracepath
+        netstat ifconfig nmcli systemctl service journalctl dmesg lspci
+        lsusb lscpu lsblk fdisk parted umount fstab crontab alias export env
+        printenv source bash zsh fish apt apt yum dnf pacman zypper snap
+        flatpak dpkg rpm make clang gdb strace lsof nmap ufw firewalld
+        man info history clear exit logout reboot shutdown poweroff
+        timedatectl hostnamectl loginctl vim nano emacs tee xargs sort uniq
+        wc cut tr column jq diff patch basename dirname realpath readlink
+        stat file chattr lsattr chroot visudo useradd usermod userdel
+        groupadd adduser swapon swapoff mkfs fsck blkid sync udevadm
+        modprobe insmod rmmod lsmod sysctl insmod mkswap swapon
+        distribution distro debian ubuntu fedora arch manjaro opensuse
+        gentoo centos rocky alma kali mint elementary zorin popos
+        package dependency repository ppa aur deb snapcraft appimage
+        portable desktop gnome kde plasma xfce lxde lxqt cinnamon mate i3
+        sway wayland xorg x11 compositor shell terminal tty pty console
+        bootloader grub initramfs root filesystem ext4 btrfs xfs zfs
+        partition mountpoint proc sysfs udev systemd unit socket timer
+        target journal cgroup namespace sandbox selinux apparmor symlink
+        hardlink superblock journaling anacron bashrc zshrc vimrc
+        known_hosts authorized_keys passphrase agent forwarding tunneling
+        dbus udev rule kernel module parameter cmdline runlevel
+        rescue mode prompt glob wildcard redirection stdin
+        stdout stderr profile aliasing completion plugin theme icon font
+        mechanic mechanical membrane keycap switch cherry brown blue
+        numpad touchpad trackball trackpoint stylus digitizer tablet
+        lcd led oled ips panel resolution refresh rate aspect brightness
+        contrast gamut hdr freesync gsync bezel stand arm vesa
+        subwoofer headset earphone webcam laser inkjet copier fax plotter
+        projector whiteboard dock docking station card reader microsd
+        flashdrive pendrive nas raid joystick gamepad controller steering
+        wheel pedal vr barcode fingerprint reader smartcard ups surge
+        protector strip charger typec thunderbolt displayport vga dvi
+        toslink coaxial spdif infrared nfc ble sim
+        motherboard chipset socket cooler heatsink aio thermal paste
+        compound chassis psu wattage modular cabling dimm sodimm ddr
+        ddr ecc timing slot channel vram graphics sound codec module
+        modem platter spindle tbw hbm
+        typea typeb typec micro mini lightning ps rs sas riser
+        overclock underclock undervolt boost tdp throttle bottleneck
+        compatibility form atx itx matx eatx sff san das enclosure bay
+        backplate bracket screw standoff curve airflow static pressure
+        decibel rgb aura cmos jumper xmp expo voltage rail efficiency
+        rating bronze gold platinum titanium
     """.trimIndent().split(Regex("\\s+")).filter { it.isNotBlank() }.distinct()
 }
