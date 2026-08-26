@@ -5,13 +5,30 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 
-class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictionary.db", null, 1) {
+class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictionary.db", null, 2) {
 
     companion object {
         private const val TABLE_WORDS = "words"
         private const val COL_PINYIN = "pinyin"
         private const val COL_WORD = "word"
         private const val COL_FREQ = "frequency"
+        private const val COL_DIGITS = "digits"
+
+        /** 拼音字母 → T9 数字 */
+        private val LETTER_TO_DIGIT = mapOf(
+            'a' to '2', 'b' to '2', 'c' to '2',
+            'd' to '3', 'e' to '3', 'f' to '3',
+            'g' to '4', 'h' to '4', 'i' to '4',
+            'j' to '5', 'k' to '5', 'l' to '5',
+            'm' to '6', 'n' to '6', 'o' to '6',
+            'p' to '7', 'q' to '7', 'r' to '7', 's' to '7',
+            't' to '8', 'u' to '8', 'v' to '8',
+            'w' to '9', 'x' to '9', 'y' to '9', 'z' to '9'
+        )
+
+        /** 拼音/英文单词 → T9 数字序列 */
+        fun toDigits(text: String): String =
+            text.lowercase().map { LETTER_TO_DIGIT[it] ?: it }.joinToString("")
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -21,9 +38,11 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
                 $COL_PINYIN TEXT NOT NULL,
                 $COL_WORD TEXT NOT NULL,
                 $COL_FREQ INTEGER DEFAULT 1,
+                $COL_DIGITS TEXT NOT NULL DEFAULT '',
                 UNIQUE($COL_PINYIN, $COL_WORD)
             )
         """)
+        db.execSQL("CREATE INDEX idx_words_digits ON $TABLE_WORDS($COL_DIGITS)")
 
         // Insert built-in tech terms
         insertTechTerms(db)
@@ -140,6 +159,7 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
                 put(COL_PINYIN, pinyin.lowercase())
                 put(COL_WORD, word)
                 put(COL_FREQ, 100) // High frequency for tech terms
+                put(COL_DIGITS, toDigits(pinyin))
             }
             db.insert(TABLE_WORDS, null, values)
         }
@@ -398,6 +418,31 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
             "chekui" to "车库",
             "cangku" to "仓库",
             "bangongshi" to "办公室",
+            // 高频功能词与常用疑问/能愿结构
+            "neng" to "能",
+            "nengbu" to "能不",
+            "nengbuneng" to "能不能",
+            "keyi" to "可以",
+            "keyima" to "可以吗",
+            "buxing" to "不行",
+            "shibushi" to "是不是",
+            "youmeiyou" to "有没有",
+            "hui" to "会",
+            "huiyi" to "会议",
+            "huibuhui" to "会不会",
+            "yaobuyao" to "要不要",
+            "xiang" to "想",
+            "xiangyao" to "想要",
+            "yinggai" to "应该",
+            "xuyao" to "需要",
+            "ganxie" to "感谢",
+            "bangzhu" to "帮助",
+            "wenti" to "问题",
+            "jueding" to "决定",
+            "kaishi" to "开始",
+            "jieshu" to "结束",
+            "zhunbei" to "准备",
+            "jihua" to "计划",
             "jiaoshi" to "教室",
             "tushuguan" to "图书馆",
             "bowuguan" to "博物馆",
@@ -626,6 +671,7 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
                 put(COL_PINYIN, pinyin.lowercase())
                 put(COL_WORD, word)
                 put(COL_FREQ, 50)
+                put(COL_DIGITS, toDigits(pinyin))
             }
             db.insert(TABLE_WORDS, null, values)
         }
@@ -656,11 +702,43 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
         return words
     }
 
-    fun incrementFrequency(pinyin: String, word: String) {
+    /** T9 前缀匹配：查数字序列以输入数字开头的所有词条（含更长词的续打匹配） */
+    fun queryByDigitsPrefix(digits: String, limit: Int): List<Pair<String, Int>> =
+        queryByDigits("$COL_DIGITS LIKE ?", "$digits%", limit)
+
+    /** T9 精确匹配：数字序列与输入完全相等的词条 */
+    fun queryByDigitsExact(digits: String, limit: Int): List<Pair<String, Int>> =
+        queryByDigits("$COL_DIGITS = ?", digits, limit)
+
+    private fun queryByDigits(where: String, arg: String, limit: Int): List<Pair<String, Int>> {
+        val words = mutableListOf<Pair<String, Int>>()
+        val db = readableDatabase
+
+        val cursor = db.query(
+            TABLE_WORDS,
+            arrayOf(COL_WORD, COL_FREQ),
+            where,
+            arrayOf(arg),
+            null, null,
+            "$COL_FREQ DESC",
+            limit.toString()
+        )
+
+        cursor.use {
+            while (it.moveToNext()) {
+                words.add(it.getString(0) to it.getInt(1))
+            }
+        }
+
+        return words
+    }
+
+    /** 按词条提升词频（用户选词学习） */
+    fun incrementFrequency(word: String) {
         val db = writableDatabase
         db.execSQL(
-            "UPDATE $TABLE_WORDS SET $COL_FREQ = $COL_FREQ + 1 WHERE $COL_PINYIN = ? AND $COL_WORD = ?",
-            arrayOf(pinyin, word)
+            "UPDATE $TABLE_WORDS SET $COL_FREQ = $COL_FREQ + 1 WHERE $COL_WORD = ?",
+            arrayOf(word)
         )
     }
 
@@ -670,6 +748,7 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
             put(COL_PINYIN, pinyin.lowercase())
             put(COL_WORD, word)
             put(COL_FREQ, frequency)
+            put(COL_DIGITS, toDigits(pinyin))
         }
         db.insertWithOnConflict(TABLE_WORDS, null, values, SQLiteDatabase.CONFLICT_REPLACE)
     }
@@ -691,6 +770,7 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
             put(COL_PINYIN, lower)
             put(COL_WORD, word)
             put(COL_FREQ, 1)
+            put(COL_DIGITS, toDigits(lower))
         }
         // 已存在时忽略，避免覆盖刚更新的词频
         db.insertWithOnConflict(TABLE_WORDS, null, values, SQLiteDatabase.CONFLICT_IGNORE)

@@ -584,7 +584,7 @@ class PersonalIMEService : InputMethodService() {
     private fun commitCandidate(candidate: PinyinEngine.Candidate) {
         currentInputConnection?.commitText(candidate.text, 1)
         if (!isPrivacyMode) {
-            pinyinEngine.incrementFrequency(currentInput, candidate.text)
+            pinyinEngine.incrementFrequency(candidate.text)
         }
         currentInput = ""
         updateCandidates()
