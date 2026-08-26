@@ -46,6 +46,11 @@ class PersonalIMEService : InputMethodService() {
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
+    companion object {
+        /** T9 未提交数字串最大长度 */
+        private const val MAX_T9_PENDING = 12
+    }
+
     // 符号键盘两页内容
     private val symbolPages = arrayOf(
         // 第 1 页：常用中文标点与符号
@@ -121,7 +126,7 @@ class PersonalIMEService : InputMethodService() {
         row2.addView(createSpecialKey("重输", ::clearInput))
         container.addView(row2)
 
-        // Row 3: 。 | PQRS  TUV  WXYZ | 换行(跨2行)
+        // Row 3: 。 | PQRS  TUV  WXYZ | 换行
         val row3 = createKeyboardRow()
         row3.addView(createNarrowKey("。", { commitPlainText("。") }))
         row3.addView(createT9Key("PQRS", '7', ::handleT9Key))
@@ -130,23 +135,14 @@ class PersonalIMEService : InputMethodService() {
         row3.addView(createSpecialKey("换行", ::handleEnter))
         container.addView(row3)
 
-        // Row 4: ? | 0 | 空格 | 中/英
+        // Row 4: ？ | 符号  123  空格  中/英（填满整行，无空白占位）
         val row4 = createKeyboardRow()
         row4.addView(createNarrowKey("？", { commitPlainText("？") }))
-        row4.addView(createT9Key("0", '0') { commitPlainText("0") })
+        row4.addView(createSpecialKey("符号", ::showSymbols))
+        row4.addView(createSpecialKey("123", ::showNumbers))
         row4.addView(createSpecialKey("空格", { handleSpace() }, weight = 2f))
         row4.addView(createSpecialKey(modeLabel(), ::toggleInputMode))
         container.addView(row4)
-
-        // Row 5: 符号  123  (底部快捷入口)
-        val row5 = createKeyboardRow()
-        row5.addView(createSpecialKey("符号", ::showSymbols, weight = 1f))
-        row5.addView(createSpecialKey("123", ::showNumbers, weight = 1f))
-        // 占位填充剩余宽度
-        row5.addView(View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 2f)
-        })
-        container.addView(row5)
     }
 
     /**
@@ -334,6 +330,8 @@ class PersonalIMEService : InputMethodService() {
     // ==================== 输入处理 ====================
 
     private fun handleT9Key(digit: Char) {
+        // 限制未提交数字串长度，避免长序列候选计算拖慢键盘；数字 0 请走 123 键盘
+        if (currentInput.length >= MAX_T9_PENDING) return
         feedbackManager.vibrate(vibrationStrength)
         feedbackManager.playSound(soundVolume)
         currentInput += digit
@@ -424,10 +422,13 @@ class PersonalIMEService : InputMethodService() {
         feedbackManager.playSound(soundVolume)
         if (currentInput.isNotEmpty()) {
             currentInput = currentInput.dropLast(1)
-            if (currentInput.isEmpty()) {
-                currentInputConnection?.finishComposingText()
-            } else {
-                updateComposingText()
+            // 仅英文模式更新 composing；T9 模式绝不把数字写进输入框
+            if (inputMode == InputMode.ENGLISH_QWERTY) {
+                if (currentInput.isEmpty()) {
+                    currentInputConnection?.finishComposingText()
+                } else {
+                    updateComposingText()
+                }
             }
             updateCandidates()
         } else {
@@ -443,12 +444,8 @@ class PersonalIMEService : InputMethodService() {
             return
         }
         if (inputMode == InputMode.CHINESE_T9) {
-            val candidates = pinyinEngine.inputT9(currentInput)
-            if (candidates.isNotEmpty()) {
-                commitCandidate(candidates[0])
-            } else {
-                commitTextDirectly(currentInput)
-            }
+            // 中文：空格上屏首选候选；无候选时静默丢弃数字，绝不上屏原始数字
+            flushT9Pending()
         } else {
             val predictions = englishEngine.predict(currentInput)
             val isKnownWord = predictions.any { it.equals(currentInput, ignoreCase = true) }
@@ -461,9 +458,28 @@ class PersonalIMEService : InputMethodService() {
         feedbackManager.vibrate(vibrationStrength)
         feedbackManager.playSound(soundVolume)
         if (currentInput.isNotEmpty()) {
-            commitTextDirectly(currentInput)
+            if (inputMode == InputMode.CHINESE_T9) {
+                flushT9Pending()
+            } else {
+                commitTextDirectly(currentInput)
+            }
         } else {
             sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
+        }
+    }
+
+    /**
+     * 提交 T9 待选数字：有候选则首选上屏，无候选则静默丢弃。
+     * 任何情况下都不把原始数字序列上屏。
+     */
+    private fun flushT9Pending() {
+        if (currentInput.isEmpty()) return
+        val candidates = pinyinEngine.inputT9(currentInput)
+        if (candidates.isNotEmpty()) {
+            commitCandidate(candidates[0])
+        } else {
+            currentInput = ""
+            updateCandidates()
         }
     }
 
@@ -473,7 +489,7 @@ class PersonalIMEService : InputMethodService() {
         feedbackManager.playSound(soundVolume)
         if (currentInput.isNotEmpty()) {
             if (inputMode == InputMode.CHINESE_T9) {
-                commitTextDirectly(currentInput)
+                flushT9Pending()
             } else {
                 commitEnglishText(currentInput)
             }

@@ -57,14 +57,16 @@ class PinyinEngine(private val database: DictionaryDatabase) {
     fun inputT9(digits: String): List<Candidate> {
         if (digits.isEmpty()) return emptyList()
 
-        // 生成所有可能的拼音分段组合
-        val possiblePinyins = generateValidPinyinCombinations(digits)
+        // 生成所有可能的拼音分段组合（已限制规模）
+        val possiblePinyins = generateValidPinyinCombinations(digits).take(MAX_QUERY_PINYINS)
 
-        // 查询数据库
+        // 查询数据库，只保留中文词条（避免 LIKE 前缀匹配把英文科技词汇捞进中文候选）
         val candidates = mutableMapOf<String, Int>()
         possiblePinyins.forEach { pinyin ->
-            database.queryWords(pinyin, 10).forEach { (word, freq) ->
-                candidates[word] = (candidates[word] ?: 0) + freq
+            database.queryWords(pinyin, 8).forEach { (word, freq) ->
+                if (word.any { it in '\u4E00'..'\u9FFF' }) {
+                    candidates[word] = (candidates[word] ?: 0) + freq
+                }
             }
         }
 
@@ -83,42 +85,36 @@ class PinyinEngine(private val database: DictionaryDatabase) {
 
     /**
      * 生成有效的拼音组合（支持多音节词的分段匹配）
-     * 例如：74732 -> qi(74) + ge(43) + ?(2) 或 shi(743) + ge(43) + ?(2)
+     * 例如：74732 -> qi(74) + ge(43) + a(2)
+     *
+     * 使用动态规划代替指数级递归：
+     * - 拼音最长 6 个字母（如 zhuang/chuang），分段长度超过 6 直接跳过
+     * - 每个位置的组合数封顶，避免长数字串时计算量爆炸卡死键盘
      */
     private fun generateValidPinyinCombinations(digits: String): List<String> {
-        if (digits.isEmpty()) return listOf("")
+        val n = digits.length
+        // dp[i] = digits[0 until i) 的所有有效拼音拼接结果
+        val dp = Array(n + 1) { mutableListOf<String>() }
+        dp[0].add("")
 
-        val results = mutableListOf<String>()
+        for (i in 1..n) {
+            for (j in maxOf(0, i - MAX_PINYIN_LEN) until i) {
+                if (dp[j].isEmpty()) continue
+                val segment = digits.substring(j, i)
+                val matches = generateLetterCombinations(segment).filter { it in validPinyins }
+                if (matches.isEmpty()) continue
 
-        // 尝试所有可能的分段方式
-        for (endIndex in 1..digits.length) {
-            val segment = digits.substring(0, endIndex)
-            val possibleLetters = generateLetterCombinations(segment)
-
-            // 检查是否有有效拼音
-            val validPinyinMatches = possibleLetters.filter { it in validPinyins }
-
-            if (validPinyinMatches.isNotEmpty()) {
-                if (endIndex == digits.length) {
-                    // 整个数字序列是一个拼音
-                    results.addAll(validPinyinMatches)
-                } else {
-                    // 递归处理剩余部分
-                    val restCombinations = generateValidPinyinCombinations(digits.substring(endIndex))
-                    validPinyinMatches.forEach { pinyin ->
-                        if (restCombinations.isEmpty()) {
-                            results.add(pinyin)
-                        } else {
-                            restCombinations.forEach { rest ->
-                                results.add(pinyin + rest)
-                            }
-                        }
+                for (prefix in dp[j]) {
+                    for (pinyin in matches) {
+                        if (dp[i].size >= MAX_COMBINATIONS) break
+                        dp[i].add(prefix + pinyin)
                     }
+                    if (dp[i].size >= MAX_COMBINATIONS) break
                 }
             }
         }
 
-        return results.distinct()
+        return dp[n].distinct()
     }
 
     /**
@@ -156,5 +152,16 @@ class PinyinEngine(private val database: DictionaryDatabase) {
 
     fun addWord(pinyin: String, word: String) {
         database.insertWord(pinyin, word)
+    }
+
+    companion object {
+        /** 拼音最长字母数（zhuang/chuang = 6） */
+        private const val MAX_PINYIN_LEN = 6
+
+        /** 单个位置的拼音组合数上限，防止长输入时计算量爆炸 */
+        private const val MAX_COMBINATIONS = 200
+
+        /** 每次查询的拼音组合数上限 */
+        private const val MAX_QUERY_PINYINS = 60
     }
 }
