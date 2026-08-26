@@ -1,0 +1,48 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # Android 工程位于仓库二级子目录
+        working-directory: PersonalIME/PersonalIME
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # 仓库未包含 gradle-wrapper.jar，直接安装 Gradle 8.5 使用
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.5'
+
+      - name: Build Release APK
+        run: gradle assembleRelease --no-daemon
+
+      - name: Build Debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PersonalIME-release
+          path: PersonalIME/PersonalIME/app/build/outputs/apk/release/*.apk
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PersonalIME-debug
+          path: PersonalIME/PersonalIME/app/build/outputs/apk/debug/*.apk

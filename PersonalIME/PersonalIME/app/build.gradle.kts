@@ -23,6 +23,8 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // CI 无正式签名时使用 debug 签名，保证 APK 可直接安装
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 

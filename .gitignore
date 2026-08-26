@@ -19,6 +19,13 @@ out/
 build/
 local.properties
 
+# Kotlin daemon / build session data
+.kotlin/
+
+# Android Studio profiler captures & heap dumps
+captures/
+*.hprof
+
 # Android Studio
 *.iml
 .idea/
