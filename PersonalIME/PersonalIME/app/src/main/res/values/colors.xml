@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Light theme colors -->
+    <color name="keyboard_bg_light">#F5F5F5</color>
+    <color name="key_bg_light">#FFFFFF</color>
+    <color name="key_text_light">#212121</color>
+    <color name="key_special_bg_light">#E0E0E0</color>
+    <color name="key_pressed_light">#BDBDBD</color>
+    <color name="candidate_bg_light">#FAFAFA</color>
+    <color name="candidate_text_light">#333333</color>
+    <color name="candidate_highlight_light">#1976D2</color>
+
+    <!-- Dark theme colors -->
+    <color name="keyboard_bg_dark">#1A1A2E</color>
+    <color name="key_bg_dark">#2D2D44</color>
+    <color name="key_text_dark">#E0E0E0</color>
+    <color name="key_special_bg_dark">#16213E</color>
+    <color name="key_pressed_dark">#0F3460</color>
+    <color name="candidate_bg_dark">#1A1A2E</color>
+    <color name="candidate_text_dark">#B0B0B0</color>
+    <color name="candidate_highlight_dark">#53C0F0</color>
+
+    <!-- Color themes -->
+    <color name="keyboard_bg_blue">#E3F2FD</color>
+    <color name="key_bg_blue">#BBDEFB</color>
+    <color name="key_text_blue">#0D47A1</color>
+    <color name="key_special_bg_blue">#90CAF9</color>
+
+    <color name="keyboard_bg_green">#E8F5E9</color>
+    <color name="key_bg_green">#C8E6C9</color>
+    <color name="key_text_green">#1B5E20</color>
+    <color name="key_special_bg_green">#A5D6A7</color>
+
+    <color name="keyboard_bg_purple">#F3E5F5</color>
+    <color name="key_bg_purple">#E1BEE7</color>
+    <color name="key_text_purple">#4A148C</color>
+    <color name="key_special_bg_purple">#CE93D8</color>
+
+    <!-- Common -->
+    <color name="transparent">#00000000</color>
+    <color name="white">#FFFFFF</color>
+    <color name="black">#000000</color>
+
+    <!-- Settings -->
+    <color name="settings_bg">#FAFAFA</color>
+    <color name="settings_card">#FFFFFF</color>
+    <color name="settings_text_primary">#212121</color>
+    <color name="settings_text_secondary">#757575</color>
+    <color name="accent">#1976D2</color>
+    <color name="accent_dark">#BB86FC</color>
+</resources>

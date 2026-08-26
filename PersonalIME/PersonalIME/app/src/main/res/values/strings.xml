@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PersonalIME</string>
+    <string name="subtype_zh">中文</string>
+    <string name="subtype_en">English</string>
+
+    <!-- Settings -->
+    <string name="settings_title">PersonalIME 设置</string>
+    <string name="keyboard_settings">键盘设置</string>
+    <string name="keyboard_height">键盘高度</string>
+    <string name="keyboard_height_summary">调节键盘高度比例</string>
+    <string name="key_size">按键大小</string>
+    <string name="key_size_summary">调节按键大小比例</string>
+    <string name="keyboard_offset">键盘偏移</string>
+    <string name="keyboard_offset_summary">单手模式左右偏移</string>
+    <string name="vibration_strength">振动反馈强度</string>
+    <string name="key_sound_volume">按键音量</string>
+    <string name="theme_settings">主题设置</string>
+    <string name="theme_selection">选择主题</string>
+    <string name="custom_background">自定义背景图片</string>
+    <string name="custom_background_summary">选择一张图片作为键盘背景</string>
+
+    <!-- Privacy -->
+    <string name="privacy_settings">隐私设置</string>
+    <string name="privacy_mode">隐私模式</string>
+    <string name="privacy_mode_summary">开启后不记录词频和学习输入习惯</string>
+
+    <!-- Tools -->
+    <string name="tools_settings">工具功能</string>
+    <string name="clipboard_manager">剪贴板管理</string>
+    <string name="clipboard_manager_summary">管理最近复制的内容</string>
+    <string name="enable_ime">启用输入法</string>
+    <string name="enable_ime_summary">在系统设置中启用 PersonalIME</string>
+    <string name="select_ime">选择输入法</string>
+    <string name="select_ime_summary">将 PersonalIME 设为当前输入法</string>
+
+    <!-- Theme names -->
+    <string name="theme_light">浅色主题</string>
+    <string name="theme_dark">深色主题</string>
+    <string name="theme_blue">蓝色主题</string>
+    <string name="theme_green">绿色主题</string>
+    <string name="theme_purple">紫色主题</string>
+
+    <!-- Keyboard -->
+    <string name="key_cn">中</string>
+    <string name="key_en">英</string>
+    <string name="clipboard">剪贴板</string>
+    <string name="emoji">表情</string>
+    <string name="symbol">符号</string>
+    <string name="settings">设置</string>
+    <string name="back">返回</string>
+    <string name="no_clipboard_items">暂无剪贴板记录</string>
+</resources>

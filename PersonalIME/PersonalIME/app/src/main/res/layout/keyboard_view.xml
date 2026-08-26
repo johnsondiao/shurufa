@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:background="@color/keyboard_bg_light">
+
+    <!-- Candidate Bar -->
+    <HorizontalScrollView
+        android:id="@+id/candidateScrollView"
+        android:layout_width="match_parent"
+        android:layout_height="40dp"
+        android:background="@color/candidate_bg_light"
+        android:scrollbars="none">
+
+        <LinearLayout
+            android:id="@+id/candidateLayout"
+            android:layout_width="wrap_content"
+            android:layout_height="match_parent"
+            android:orientation="horizontal"
+            android:padding="4dp" />
+    </HorizontalScrollView>
+
+    <!-- Keyboard Container -->
+    <LinearLayout
+        android:id="@+id/keyboardContainer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="4dp" />
+
+</LinearLayout>
