@@ -73,7 +73,7 @@ class PersonalIMEService : InputMethodService() {
         clipboardManager = ClipboardManager(this)
         feedbackManager = FeedbackManager(this)
 
-        // 后台预热词库（首次安装需导入 17 万条资产词条）
+        // 后台预热词库（首次安装需导入 40 万条资产词条）
         serviceScope.launch(Dispatchers.IO) {
             database.warmUp()
         }

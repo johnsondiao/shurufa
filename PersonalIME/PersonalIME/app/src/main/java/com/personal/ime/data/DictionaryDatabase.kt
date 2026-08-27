@@ -6,7 +6,13 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 
 class DictionaryDatabase(private val appContext: Context) :
-    SQLiteOpenHelper(appContext, "dictionary.db", null, 5) {
+    SQLiteOpenHelper(appContext, "dictionary.db", null, 6) {
+
+    override fun onConfigure(db: SQLiteDatabase) {
+        super.onConfigure(db)
+        // WAL：首次建库导入 40 万条词条期间，读请求不被写事务阻塞
+        db.setWriteAheadLoggingEnabled(true)
+    }
 
     companion object {
         private const val TABLE_WORDS = "words"
@@ -709,7 +715,8 @@ class DictionaryDatabase(private val appContext: Context) :
             val values = ContentValues().apply {
                 put(COL_PINYIN, pinyin.lowercase())
                 put(COL_WORD, word)
-                put(COL_FREQ, 50)
+                // 手编最高频词档：高于单字分层词频（55~85）与词组（46~50）
+                put(COL_FREQ, 90)
                 put(COL_DIGITS, toDigits(pinyin))
             }
             db.insert(TABLE_WORDS, null, values)
@@ -727,6 +734,10 @@ class DictionaryDatabase(private val appContext: Context) :
             return
         }
 
+        // 预编译插入语句：40 万条导入时避免逐条编译，速度提升一个数量级
+        val insert = db.compileStatement(
+            "INSERT OR IGNORE INTO $TABLE_WORDS($COL_PINYIN, $COL_WORD, $COL_FREQ, $COL_DIGITS) VALUES(?,?,?,?)"
+        )
         db.beginTransaction()
         try {
             for (line in lines) {
@@ -735,17 +746,16 @@ class DictionaryDatabase(private val appContext: Context) :
                 val pinyin = parts[0]
                 val word = parts[1]
                 val freq = parts[2].toIntOrNull() ?: continue
-                val values = ContentValues().apply {
-                    put(COL_PINYIN, pinyin)
-                    put(COL_WORD, word)
-                    put(COL_FREQ, freq)
-                    put(COL_DIGITS, toDigits(pinyin))
-                }
-                db.insertWithOnConflict(TABLE_WORDS, null, values, SQLiteDatabase.CONFLICT_IGNORE)
+                insert.bindString(1, pinyin)
+                insert.bindString(2, word)
+                insert.bindLong(3, freq.toLong())
+                insert.bindString(4, toDigits(pinyin))
+                insert.executeInsert()
             }
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
+            insert.close()
         }
     }
 
@@ -797,7 +807,8 @@ class DictionaryDatabase(private val appContext: Context) :
             where,
             arrayOf(arg),
             null, null,
-            "$COL_FREQ DESC",
+            // 同词频时短词优先：打完整音节时二字词排在四字成语前面
+            "$COL_FREQ DESC, LENGTH($COL_WORD) ASC",
             limit.toString()
         )
 
