@@ -17,8 +17,10 @@ class DictionaryDatabase(private val appContext: Context) :
 
     override fun onConfigure(db: SQLiteDatabase) {
         super.onConfigure(db)
-        // WAL：首次建库导入 40 万条词条期间，读请求不被写事务阻塞
-        db.setWriteAheadLoggingEnabled(true)
+        // WAL：首次建库导入 40 万条词条期间，读请求不被写事务阻塞。
+        // 注意 setWriteAheadLoggingEnabled 是隐藏 API，公开 API 只有已废弃的 enableWriteAheadLogging
+        @Suppress("DEPRECATION")
+        db.enableWriteAheadLogging()
     }
 
     companion object {
