@@ -5,6 +5,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -46,3 +49,18 @@ jobs:
         with:
           name: PersonalIME-debug
           path: PersonalIME/PersonalIME/app/build/outputs/apk/debug/*.apk
+
+      # 发布到 GitHub Releases：附件公开可下载，手机浏览器直接安装，无需登录 Actions
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: PersonalIME v1.0.${{ github.run_number }}
+          body: |
+            自动构建（提交 ${{ github.sha }}）
+
+            下载 PersonalIME-release.apk 安装。
+            注意：首次启动需导入词库（40 万条），候选栏显示“词库加载中…”属正常现象。
+          files: |
+            PersonalIME/PersonalIME/app/build/outputs/apk/release/*.apk
+            PersonalIME/PersonalIME/app/build/outputs/apk/debug/*.apk
