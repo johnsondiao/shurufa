@@ -9,7 +9,7 @@
     <HorizontalScrollView
         android:id="@+id/candidateScrollView"
         android:layout_width="match_parent"
-        android:layout_height="40dp"
+        android:layout_height="46dp"
         android:background="@color/candidate_bg_light"
         android:scrollbars="none">
 

@@ -5,7 +5,7 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 
-class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictionary.db", null, 2) {
+class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictionary.db", null, 3) {
 
     companion object {
         private const val TABLE_WORDS = "words"
@@ -443,6 +443,32 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
             "jieshu" to "结束",
             "zhunbei" to "准备",
             "jihua" to "计划",
+            // “度”类高频词与常用搭配
+            "du" to "度",
+            "gaodu" to "高度",
+            "sudu" to "速度",
+            "wendu" to "温度",
+            "jiaodu" to "角度",
+            "shendu" to "深度",
+            "yingdu" to "硬度",
+            "shidu" to "湿度",
+            "kuandu" to "宽度",
+            "changdu" to "长度",
+            "houdu" to "厚度",
+            "nongdu" to "浓度",
+            "qiangdu" to "强度",
+            "yuedu" to "阅读",
+            "gaoxing" to "高兴",
+            "gaoshou" to "高手",
+            "gaoji" to "高级",
+            "gaosu" to "高速",
+            "gaobie" to "告别",
+            "gaozhi" to "告知",
+            "gailv" to "概率",
+            "gaibian" to "改变",
+            "gaishan" to "改善",
+            "gaikuang" to "概况",
+            "gainian" to "概念",
             "jiaoshi" to "教室",
             "tushuguan" to "图书馆",
             "bowuguan" to "博物馆",

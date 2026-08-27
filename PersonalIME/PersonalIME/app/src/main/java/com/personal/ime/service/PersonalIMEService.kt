@@ -1,5 +1,7 @@
 package com.personal.ime.service
 
+import android.graphics.Color
+import android.graphics.Typeface
 import android.inputmethodservice.InputMethodService
 import android.view.KeyEvent
 import android.view.View
@@ -254,7 +256,7 @@ class PersonalIMEService : InputMethodService() {
     // ==================== 按键工厂 ====================
 
     private fun createKeyboardRow(): LinearLayout {
-        val rowHeightPx = (48 * resources.displayMetrics.density).toInt()
+        val rowHeightPx = (60 * resources.displayMetrics.density).toInt()
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
@@ -552,6 +554,10 @@ class PersonalIMEService : InputMethodService() {
         if (currentInput.isEmpty()) return
 
         if (inputMode == InputMode.CHINESE_T9) {
+            // 拼音回显：在候选词前显示数字串对应的拼音分段（如 gao du）
+            pinyinEngine.pinyinSplits(currentInput).take(3).forEach { py ->
+                candidatesView.addView(createPinyinView(py))
+            }
             pinyinEngine.inputT9(currentInput).take(10).forEach { candidate ->
                 candidatesView.addView(
                     createCandidateView(candidate.text) { commitCandidate(candidate) }
@@ -573,6 +579,17 @@ class PersonalIMEService : InputMethodService() {
             textSize = 16f
             setPadding(16, 8, 16, 8)
             setOnClickListener { onClick() }
+        }
+    }
+
+    /** 候选栏左侧的拼音回显（仅展示，不可点击） */
+    private fun createPinyinView(text: String): TextView {
+        return TextView(this).apply {
+            this.text = text
+            textSize = 15f
+            setTypeface(Typeface.DEFAULT_BOLD)
+            setTextColor(Color.parseColor("#1E8E3E"))
+            setPadding(24, 8, 24, 8)
         }
     }
 
