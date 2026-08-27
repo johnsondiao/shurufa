@@ -5,7 +5,7 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 
-class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictionary.db", null, 4) {
+class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictionary.db", null, 5) {
 
     companion object {
         private const val TABLE_WORDS = "words"
@@ -30,8 +30,11 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
         fun toDigits(text: String): String =
             text.lowercase().map { LETTER_TO_DIGIT[it] ?: it }.joinToString("")
 
-        /** 单字词库资产文件 */
+        /** 单字词库资产文件（《通用规范汉字表》8105 字） */
         private const val ASSET_CN_CHARS = "cn_chars.txt"
+
+        /** 词语/成字词库资产文件（汉典成语 + 2-4 字词组，约 16 万条） */
+        private const val ASSET_CN_WORDS = "cn_words.txt"
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -51,7 +54,10 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
         insertTechTerms(db)
 
         // Insert 《通用规范汉字表》单字（覆盖新华字典全部汉字）
-        loadStandardChars(db)
+        loadAssetWords(db, ASSET_CN_CHARS)
+
+        // Insert 词语/成字词库（汉典成语 + 2-4 字词组）
+        loadAssetWords(db, ASSET_CN_WORDS)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -710,12 +716,12 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
     }
 
     /**
-     * 从 assets/cn_chars.txt 加载《通用规范汉字表》8105 字（每行 "拼音 汉字 词频"）。
-     * 词频 40 低于精编词组(50)，保证常用词优先于单字；用户选字学习后会逐步提升。
+     * 从资产文件批量导入词条（每行 "拼音 词条 词频"，空格分隔）。
+     * 精编词组先插入，资产词条用 CONFLICT_IGNORE 避免覆盖；事务提交保证性能。
      */
-    private fun loadStandardChars(db: SQLiteDatabase) {
+    private fun loadAssetWords(db: SQLiteDatabase, assetName: String) {
         val lines = try {
-            context.assets.open(ASSET_CN_CHARS).bufferedReader().use { it.readLines() }
+            context.assets.open(assetName).bufferedReader().use { it.readLines() }
         } catch (e: Exception) {
             return
         }
@@ -740,6 +746,11 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
         } finally {
             db.endTransaction()
         }
+    }
+
+    /** 后台预热：触发首次建库与资产导入，避免用户第一次按键时卡住主线程 */
+    fun warmUp() {
+        readableDatabase
     }
 
     fun queryWords(pinyin: String, limit: Int = 20): List<Pair<String, Int>> {
