@@ -6,7 +6,7 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 
 class DictionaryDatabase(private val appContext: Context) :
-    SQLiteOpenHelper(appContext, "dictionary.db", null, 7) {
+    SQLiteOpenHelper(appContext, "dictionary.db", null, 8) {
 
     /** 词库是否已完成首次建库导入（未就绪时在 Service 展示提示，避免主线程阻塞） */
     @Volatile
@@ -28,7 +28,7 @@ class DictionaryDatabase(private val appContext: Context) :
         private const val COL_FREQ = "frequency"
         private const val COL_DIGITS = "digits"
 
-        /** 拼音字母 → T9 数字 */
+        /** 拼音字母 → T9 数字（v 是 ü 的键入形式，与 u 同键） */
         private val LETTER_TO_DIGIT = mapOf(
             'a' to '2', 'b' to '2', 'c' to '2',
             'd' to '3', 'e' to '3', 'f' to '3',
@@ -40,9 +40,10 @@ class DictionaryDatabase(private val appContext: Context) :
             'w' to '9', 'x' to '9', 'y' to '9', 'z' to '9'
         )
 
-        /** 拼音/英文单词 → T9 数字序列 */
+        /** 拼音/英文单词 → T9 数字序列（忽略音节分隔符 '） */
         fun toDigits(text: String): String =
-            text.lowercase().map { LETTER_TO_DIGIT[it] ?: it }.joinToString("")
+            text.lowercase().filter { it != '\'' }
+                .map { LETTER_TO_DIGIT[it] ?: it }.joinToString("")
 
         /** 单字词库资产文件（《通用规范汉字表》8105 字） */
         private const val ASSET_CN_CHARS = "cn_chars.txt"
@@ -801,21 +802,22 @@ class DictionaryDatabase(private val appContext: Context) :
         return words
     }
 
-    /** T9 前缀匹配：查数字序列以输入数字开头的所有词条（含更长词的续打匹配） */
-    fun queryByDigitsPrefix(digits: String, limit: Int): List<Pair<String, Int>> =
+    /** T9 前缀匹配：查数字序列以输入数字开头的所有词条（含更长词的续打匹配）。
+     *  返回 (词条, 带音节分隔的拼音, 词频)，供引擎校验强制音节边界。 */
+    fun queryByDigitsPrefix(digits: String, limit: Int): List<Triple<String, String, Int>> =
         queryByDigits("$COL_DIGITS GLOB ?", "$digits*", limit)
 
     /** T9 精确匹配：数字序列与输入完全相等的词条 */
-    fun queryByDigitsExact(digits: String, limit: Int): List<Pair<String, Int>> =
+    fun queryByDigitsExact(digits: String, limit: Int): List<Triple<String, String, Int>> =
         queryByDigits("$COL_DIGITS = ?", digits, limit)
 
-    private fun queryByDigits(where: String, arg: String, limit: Int): List<Pair<String, Int>> {
-        val words = mutableListOf<Pair<String, Int>>()
+    private fun queryByDigits(where: String, arg: String, limit: Int): List<Triple<String, String, Int>> {
+        val words = mutableListOf<Triple<String, String, Int>>()
         val db = readableDatabase
 
         val cursor = db.query(
             TABLE_WORDS,
-            arrayOf(COL_WORD, COL_FREQ),
+            arrayOf(COL_WORD, COL_PINYIN, COL_FREQ),
             where,
             arrayOf(arg),
             null, null,
@@ -826,7 +828,7 @@ class DictionaryDatabase(private val appContext: Context) :
 
         cursor.use {
             while (it.moveToNext()) {
-                words.add(it.getString(0) to it.getInt(1))
+                words.add(Triple(it.getString(0), it.getString(1), it.getInt(2)))
             }
         }
 

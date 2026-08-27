@@ -58,12 +58,14 @@ class PersonalIMEService : InputMethodService() {
         private const val MAX_T9_PENDING = 12
     }
 
-    // 符号键盘两页内容
+    // 符号键盘三页内容
     private val symbolPages = arrayOf(
         // 第 1 页：常用中文标点与符号
-        arrayOf("，", "。", "、", "；", "：", "？", "！", "「", "」"),
-        // 第 2 页：括号、数学、货币等
-        arrayOf("（", "）", "【", "】", "《", "》", "…", "—", "·")
+        arrayOf("，", "。", "、", "；", ":", "？", "！", "「", "」"),
+        // 第 2 页：括号、书名号、省略号等
+        arrayOf("（", ")", "【", "]", "《", ">", "…", "—", "·"),
+        // 第 3 页：英文符号与数学/货币符（含原 T9 主键盘 1 键让出的 @ #）
+        arrayOf("@", "#", "$", "%", "&", "*", "+", "=", "~")
     )
 
     override fun onCreate() {
@@ -117,14 +119,14 @@ class PersonalIMEService : InputMethodService() {
 
     /**
      * T9 键盘布局（参考主流输入法）：
-     * 左列：, / 。 ?    中3列：@# ABC DEF / GHI JKL MNO / PQRS TUV WXYZ    右列：⌫ 重输 换行
+     * 左列：, / 。 ?    中3列：1' ABC DEF / GHI JKL MNO / PQRS TUV WXYZ    右列：⌫ 重输 换行
      * 底行：符号  123  空格  中/英
      */
     private fun buildT9Keyboard(container: LinearLayout) {
-        // Row 1: , | @#  ABC  DEF | ⌫
+        // Row 1: , | 1'  ABC  DEF | ⌫
         val row1 = createKeyboardRow()
         row1.addView(createNarrowKey("，", { commitPlainText("，") }))
-        row1.addView(createT9Key("@#", '1') { showSymbols() })
+        row1.addView(createT9Key("1'", '1', ::handleT9Separator))
         row1.addView(createT9Key("ABC", '2', ::handleT9Key))
         row1.addView(createT9Key("DEF", '3', ::handleT9Key))
         row1.addView(createSpecialKey("⌫", ::handleDelete))
@@ -182,7 +184,7 @@ class PersonalIMEService : InputMethodService() {
             // 右列
             when (row) {
                 0 -> rowView.addView(createSpecialKey("⌫", ::handleDelete))
-                1 -> rowView.addView(createSpecialKey(if (symbolPage == 1) "2/2" else "1/2", ::toggleSymbolPage))
+                1 -> rowView.addView(createSpecialKey("${symbolPage % symbolPages.size + 1}/${symbolPages.size}", ::toggleSymbolPage))
                 2 -> rowView.addView(createSpecialKey("返回", ::backToT9))
             }
             container.addView(rowView)
@@ -346,10 +348,21 @@ class PersonalIMEService : InputMethodService() {
 
     private fun handleT9Key(digit: Char) {
         // 限制未提交数字串长度，避免长序列候选计算拖慢键盘；数字 0 请走 123 键盘
-        if (currentInput.length >= MAX_T9_PENDING) return
+        // 分隔符 ' 不计入长度
+        if (currentInput.count { it != '\'' } >= MAX_T9_PENDING) return
         feedbackManager.vibrate(vibrationStrength)
         feedbackManager.playSound(soundVolume)
         currentInput += digit
+        updateCandidates()
+    }
+
+    /** T9 分词键（1 键）：在数字串中插入音节分隔符，强制切分如 94'26 = xi'an */
+    private fun handleT9Separator(digit: Char) {
+        feedbackManager.vibrate(vibrationStrength)
+        feedbackManager.playSound(soundVolume)
+        // 不能开头、不能连续（仅在已有数字且末尾是数字时插入）
+        if (currentInput.isEmpty() || currentInput.last() == '\'') return
+        currentInput += '\''
         updateCandidates()
     }
 
@@ -464,7 +477,7 @@ class PersonalIMEService : InputMethodService() {
     /** 符号键盘翻页 */
     private fun toggleSymbolPage() {
         feedbackManager.vibrate(vibrationStrength)
-        symbolPage = if (symbolPage == 1) 2 else 1
+        symbolPage = symbolPage % symbolPages.size + 1
         rebuildKeyboard()
     }
 

@@ -53,23 +53,40 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         // 词库尚未完成首次导入时由调用方展示提示，这里直接返回空避免阻塞主线程
         if (!database.isReady) return emptyList()
 
-        val merged = LinkedHashMap<String, Int>()
-
-        // 1) 续打匹配：词条数字序列以输入开头的词（含恰好等长的词）
-        database.queryByDigitsPrefix(digits, 20).forEach { (word, freq) ->
-            if (word.any { it in '\u4E00'..'\u9FFF' }) {
-                merged[word] = (merged[word] ?: 0) + freq
+        // 分隔符（'）切出强制音节边界：记录数字长累计位置，如 94'26 -> [2, 4]
+        val boundaries = mutableListOf<Int>()
+        var acc = 0
+        for (ch in digits) {
+            if (ch == '\'') {
+                if (acc > 0 && boundaries.lastOrNull() != acc) boundaries.add(acc)
+            } else {
+                acc++
             }
         }
+        val plain = digits.filter { it != '\'' }
+
+        val merged = LinkedHashMap<String, Int>()
+
+        // 1) 续打匹配：词条数字序列以输入开头的词（含恰好等长的词）。
+        //    带 ' 时按强制音节边界过滤（如 94'26 只要 xi'an 类，排除 xian 类），
+        //    验证会淘汰部分候选，故多取一些再截断
+        database.queryByDigitsPrefix(plain, 48)
+            .filter { (word, pinyin, _) ->
+                word.any { it in '\u4E00'..'\u9FFF' } && matchesBoundaries(pinyin, boundaries)
+            }
+            .forEach { (word, _, freq) ->
+                merged[word] = (merged[word] ?: 0) + freq
+            }
 
         // 2) 回退：从长到短找"恰好打完"的最长前缀，让已打完的短词在续打更长的词时仍可见
-        //    例如词库无"能不能"时，输入 6364286364 仍应给出"能"(6364)
         if (merged.size < CANDIDATE_LIMIT) {
-            for (p in digits.length - 1 downTo 1) {
-                val exact = database.queryByDigitsExact(digits.substring(0, p), 10)
-                    .filter { (word, _) -> word.any { it in '\u4E00'..'\u9FFF' } }
+            for (p in plain.length - 1 downTo 1) {
+                val exact = database.queryByDigitsExact(plain.substring(0, p), 16)
+                    .filter { (word, pinyin, _) ->
+                        word.any { it in '\u4E00'..'\u9FFF' } && matchesBoundaries(pinyin, boundaries)
+                    }
                 if (exact.isNotEmpty()) {
-                    exact.forEach { (word, freq) ->
+                    exact.forEach { (word, _, freq) ->
                         merged[word] = (merged[word] ?: 0) + freq
                     }
                     break
@@ -87,13 +104,66 @@ class PinyinEngine(private val database: DictionaryDatabase) {
     }
 
     /**
+     * 强制音节边界验证：候选拼音的音节切分须覆盖输入的所有边界位置。
+     * - 带 ' 的拼音（资产词）：音节边界由数据源确定，严格校验
+     * - 连写拼音（精编词/单字）：允许任意有效音节切分覆盖边界（DP）
+     */
+    private fun matchesBoundaries(pinyin: String, boundaries: List<Int>): Boolean {
+        if (boundaries.isEmpty()) return true
+        if (pinyin.contains('\'')) {
+            val lens = mutableSetOf<Int>()
+            var acc = 0
+            for (syl in pinyin.split('\'')) {
+                if (syl.isEmpty()) continue
+                acc += syl.length
+                lens.add(acc)
+            }
+            return boundaries.all { it in lens }
+        }
+        val n = pinyin.length
+        // reachable[i]：前 i 个字母可完整切分为有效音节
+        val reachable = BooleanArray(n + 1)
+        reachable[0] = true
+        for (i in 1..n) {
+            for (j in maxOf(0, i - MAX_PINYIN_LEN) until i) {
+                if (reachable[j] && pinyin.substring(j, i) in validPinyins) {
+                    reachable[i] = true
+                    break
+                }
+            }
+        }
+        if (!reachable[n]) return true // 无法切分（英文词等）：不因分隔符排除
+        return boundaries.all { it in 0..n && reachable[it] }
+    }
+
+    /**
      * 候选栏拼音回显：把 T9 数字串分段为可读拼音（音节间空格分隔）。
      * 例如 42638 -> ["gao du"]；尾部尚不成音节时返回已解析出的最长部分。
+     * 输入含强制分隔符（94'26）时，各段独立取默认切分后拼接。
      */
     fun pinyinSplits(digits: String, limit: Int = 3): List<String> {
         if (digits.isEmpty()) return emptyList()
 
+        if (digits.contains('\'')) {
+            val parts = digits.split('\'').filter { it.isNotEmpty() }
+            val rendered = parts.map { seg -> fullSplits(seg).firstOrNull() ?: seg }
+            return listOf(rendered.joinToString(" "))
+        }
+
+        val full = fullSplits(digits)
+        if (full.isNotEmpty()) return full.distinct().take(limit)
+        // 整串不可分段：回退到最长的可完整分段前缀
+        for (i in digits.length - 1 downTo 1) {
+            val prefixSplits = fullSplits(digits.substring(0, i))
+            if (prefixSplits.isNotEmpty()) return prefixSplits.distinct().take(limit)
+        }
+        return emptyList()
+    }
+
+    /** 整串全部有效拼音分段（有界 DP；段长<=6，每位置封顶 MAX_DISPLAY_SPLITS） */
+    private fun fullSplits(digits: String): List<String> {
         val n = digits.length
+        if (n == 0) return emptyList()
         val dp = Array(n + 1) { mutableListOf<String>() }
         dp[0].add("")
 
@@ -113,12 +183,7 @@ class PinyinEngine(private val database: DictionaryDatabase) {
             }
         }
 
-        // 整串可分段则直接返回；否则回退到最长的可完整分段前缀
-        if (dp[n].isNotEmpty()) return dp[n].distinct().take(limit)
-        for (i in n - 1 downTo 1) {
-            if (dp[i].isNotEmpty()) return dp[i].distinct().take(limit)
-        }
-        return emptyList()
+        return dp[n]
     }
 
     /** 单个数字段的所有有效拼音（字母组合规模有界，段长 <= 6） */
