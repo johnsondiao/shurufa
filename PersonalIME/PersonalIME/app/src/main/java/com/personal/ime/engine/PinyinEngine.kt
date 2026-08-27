@@ -151,7 +151,11 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         }
 
         val full = fullSplits(digits)
-        if (full.isNotEmpty()) return full.distinct().take(limit)
+        if (full.isNotEmpty()) {
+            return full.distinct()
+                .sortedBy { it.count { c -> c == ' ' } }  // 空格少的优先（切分少的 = 完整拼音）
+                .take(limit)
+        }
         // 整串不可分段：回退到最长的可完整分段前缀
         for (i in digits.length - 1 downTo 1) {
             val prefixSplits = fullSplits(digits.substring(0, i))
