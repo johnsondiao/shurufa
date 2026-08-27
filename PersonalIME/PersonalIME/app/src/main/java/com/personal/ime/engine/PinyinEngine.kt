@@ -50,6 +50,8 @@ class PinyinEngine(private val database: DictionaryDatabase) {
 
     fun inputT9(digits: String): List<Candidate> {
         if (digits.isEmpty()) return emptyList()
+        // 词库尚未完成首次导入时由调用方展示提示，这里直接返回空避免阻塞主线程
+        if (!database.isReady) return emptyList()
 
         val merged = LinkedHashMap<String, Int>()
 
@@ -77,7 +79,10 @@ class PinyinEngine(private val database: DictionaryDatabase) {
 
         return merged.entries
             .map { Candidate(it.key, it.value) }
-            .sortedByDescending { it.frequency }
+            .sortedWith(
+                // 词频降序；同频短词优先（打完整音节时二字词排在四字成语前）
+                compareByDescending<Candidate> { it.frequency }.thenBy { it.text.length }
+            )
             .take(CANDIDATE_LIMIT)
     }
 

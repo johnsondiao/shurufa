@@ -6,7 +6,14 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 
 class DictionaryDatabase(private val appContext: Context) :
-    SQLiteOpenHelper(appContext, "dictionary.db", null, 6) {
+    SQLiteOpenHelper(appContext, "dictionary.db", null, 7) {
+
+    /** 词库是否已完成首次建库导入（未就绪时在 Service 展示提示，避免主线程阻塞） */
+    @Volatile
+    private var ready = false
+
+    val isReady: Boolean
+        get() = ready
 
     override fun onConfigure(db: SQLiteDatabase) {
         super.onConfigure(db)
@@ -55,7 +62,10 @@ class DictionaryDatabase(private val appContext: Context) :
                 UNIQUE($COL_PINYIN, $COL_WORD)
             )
         """)
-        db.execSQL("CREATE INDEX idx_words_digits ON $TABLE_WORDS($COL_DIGITS)")
+        // 复合索引：digits/pinyin 前缀匹配 + frequency 降序可全程走索引，免临时排序
+        // （单列 digits 索引由本复合索引前缀覆盖，不再单独建）
+        db.execSQL("CREATE INDEX idx_words_digits_freq ON $TABLE_WORDS($COL_DIGITS, $COL_FREQ DESC)")
+        db.execSQL("CREATE INDEX idx_words_pinyin_freq ON $TABLE_WORDS($COL_PINYIN, $COL_FREQ DESC)")
 
         // Insert built-in tech terms
         insertTechTerms(db)
@@ -762,17 +772,19 @@ class DictionaryDatabase(private val appContext: Context) :
     /** 后台预热：触发首次建库与资产导入，避免用户第一次按键时卡住主线程 */
     fun warmUp() {
         readableDatabase
+        ready = true
     }
 
     fun queryWords(pinyin: String, limit: Int = 20): List<Pair<String, Int>> {
         val words = mutableListOf<Pair<String, Int>>()
         val db = readableDatabase
 
+        // GLOB 大小写敏感，可走 BINARY 索引范围扫描；LIKE 在 BINARY 列上不会用索引
         val cursor = db.query(
             TABLE_WORDS,
             arrayOf(COL_WORD, COL_FREQ),
-            "$COL_PINYIN LIKE ?",
-            arrayOf("$pinyin%"),
+            "$COL_PINYIN GLOB ?",
+            arrayOf(pinyin.lowercase() + "*"),
             null, null,
             "$COL_FREQ DESC",
             limit.toString()
@@ -791,7 +803,7 @@ class DictionaryDatabase(private val appContext: Context) :
 
     /** T9 前缀匹配：查数字序列以输入数字开头的所有词条（含更长词的续打匹配） */
     fun queryByDigitsPrefix(digits: String, limit: Int): List<Pair<String, Int>> =
-        queryByDigits("$COL_DIGITS LIKE ?", "$digits%", limit)
+        queryByDigits("$COL_DIGITS GLOB ?", "$digits*", limit)
 
     /** T9 精确匹配：数字序列与输入完全相等的词条 */
     fun queryByDigitsExact(digits: String, limit: Int): List<Pair<String, Int>> =
@@ -807,8 +819,8 @@ class DictionaryDatabase(private val appContext: Context) :
             where,
             arrayOf(arg),
             null, null,
-            // 同词频时短词优先：打完整音节时二字词排在四字成语前面
-            "$COL_FREQ DESC, LENGTH($COL_WORD) ASC",
+            // 词频降序可走复合索引免排序；同频短词优先在引擎层内存排序
+            "$COL_FREQ DESC",
             limit.toString()
         )
 

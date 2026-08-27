@@ -7,6 +7,7 @@ import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.personal.ime.data.ClipboardManager
@@ -46,6 +47,7 @@ class PersonalIMEService : InputMethodService() {
 
     private var keyboardContainer: LinearLayout? = null
     private var candidateLayout: LinearLayout? = null
+    private var candidateScrollView: HorizontalScrollView? = null
     private var shiftKey: Button? = null
     private val qwertyLetterKeys = mutableListOf<Button>()
 
@@ -93,6 +95,7 @@ class PersonalIMEService : InputMethodService() {
         val keyboardView = layoutInflater.inflate(com.personal.ime.R.layout.keyboard_view, null)
         keyboardContainer = keyboardView.findViewById(com.personal.ime.R.id.keyboardContainer)
         candidateLayout = keyboardView.findViewById(com.personal.ime.R.id.candidateLayout)
+        candidateScrollView = keyboardView.findViewById(com.personal.ime.R.id.candidateScrollView)
         rebuildKeyboard()
         return keyboardView
     }
@@ -524,6 +527,7 @@ class PersonalIMEService : InputMethodService() {
      */
     private fun flushT9Pending() {
         if (currentInput.isEmpty()) return
+        if (!database.isReady) return // 词库未就绪：保留输入，等加载完成后再上屏
         val candidates = pinyinEngine.inputT9(currentInput)
         if (candidates.isNotEmpty()) {
             commitCandidate(candidates[0])
@@ -556,34 +560,50 @@ class PersonalIMEService : InputMethodService() {
     private fun updateCandidates() {
         val candidatesView = candidateLayout ?: return
         candidatesView.removeAllViews()
+        // 新一轮候选从头展示，避免停留在上一次的横向滚动位置
+        candidateScrollView?.scrollTo(0, 0)
         if (currentInput.isEmpty()) return
 
+        // 首次建库导入期间不查库（readableDatabase 会阻塞到导入完成），提示用户稍候
+        if (!database.isReady) {
+            candidatesView.addView(createPinyinView("词库加载中…"))
+            return
+        }
+
         if (inputMode == InputMode.CHINESE_T9) {
-            // 拼音回显：在候选词前显示数字串对应的拼音分段（如 gao du）
-            pinyinEngine.pinyinSplits(currentInput).take(3).forEach { py ->
+            // 拼音回显：显示默认切分（如 gao du），与主流输入法一致只展示一个
+            pinyinEngine.pinyinSplits(currentInput).take(1).forEach { py ->
                 candidatesView.addView(createPinyinView(py))
             }
-            pinyinEngine.inputT9(currentInput).take(10).forEach { candidate ->
+            pinyinEngine.inputT9(currentInput).take(10).forEachIndexed { index, candidate ->
                 candidatesView.addView(
-                    createCandidateView(candidate.text) { commitCandidate(candidate) }
+                    createCandidateView(candidate.text, index == 0) { commitCandidate(candidate) }
                 )
             }
         } else {
-            englishEngine.predict(currentInput).take(10).forEach { word ->
+            englishEngine.predict(currentInput).take(10).forEachIndexed { index, word ->
                 val display = applyInputCase(word)
                 candidatesView.addView(
-                    createCandidateView(display) { commitEnglishWithAutoBack(display) }
+                    createCandidateView(display, index == 0) { commitEnglishWithAutoBack(display) }
                 )
             }
         }
     }
 
-    private fun createCandidateView(text: String, onClick: () -> Unit): TextView {
+    private fun createCandidateView(text: String, isPrimary: Boolean = false, onClick: () -> Unit): TextView {
         return TextView(this).apply {
             this.text = text
             textSize = 16f
             setPadding(16, 8, 16, 8)
-            setOnClickListener { onClick() }
+            if (isPrimary) {
+                // 首选候选高亮：提示空格键将上屏的词
+                setBackgroundResource(com.personal.ime.R.drawable.candidate_highlight)
+                setTextColor(Color.WHITE)
+            }
+            setOnClickListener {
+                feedbackManager.vibrate(vibrationStrength)
+                onClick()
+            }
         }
     }
 

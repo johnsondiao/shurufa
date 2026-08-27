@@ -13,7 +13,7 @@ import com.personal.ime.util.EnglishWords
 class EnglishEngine(private val database: DictionaryDatabase) {
 
     fun predict(prefix: String, limit: Int = 10): List<String> {
-        if (prefix.length < 2) return emptyList()
+        if (prefix.length < 2 || !database.isReady) return emptyList()
 
         val lower = prefix.lowercase()
         val scores = HashMap<String, Long>()
