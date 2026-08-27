@@ -5,7 +5,7 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 
-class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictionary.db", null, 3) {
+class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictionary.db", null, 4) {
 
     companion object {
         private const val TABLE_WORDS = "words"
@@ -29,6 +29,9 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
         /** 拼音/英文单词 → T9 数字序列 */
         fun toDigits(text: String): String =
             text.lowercase().map { LETTER_TO_DIGIT[it] ?: it }.joinToString("")
+
+        /** 单字词库资产文件 */
+        private const val ASSET_CN_CHARS = "cn_chars.txt"
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -46,6 +49,9 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
 
         // Insert built-in tech terms
         insertTechTerms(db)
+
+        // Insert 《通用规范汉字表》单字（覆盖新华字典全部汉字）
+        loadStandardChars(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -700,6 +706,39 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
                 put(COL_DIGITS, toDigits(pinyin))
             }
             db.insert(TABLE_WORDS, null, values)
+        }
+    }
+
+    /**
+     * 从 assets/cn_chars.txt 加载《通用规范汉字表》8105 字（每行 "拼音 汉字 词频"）。
+     * 词频 40 低于精编词组(50)，保证常用词优先于单字；用户选字学习后会逐步提升。
+     */
+    private fun loadStandardChars(db: SQLiteDatabase) {
+        val lines = try {
+            context.assets.open(ASSET_CN_CHARS).bufferedReader().use { it.readLines() }
+        } catch (e: Exception) {
+            return
+        }
+
+        db.beginTransaction()
+        try {
+            for (line in lines) {
+                val parts = line.split(' ')
+                if (parts.size != 3) continue
+                val pinyin = parts[0]
+                val word = parts[1]
+                val freq = parts[2].toIntOrNull() ?: continue
+                val values = ContentValues().apply {
+                    put(COL_PINYIN, pinyin)
+                    put(COL_WORD, word)
+                    put(COL_FREQ, freq)
+                    put(COL_DIGITS, toDigits(pinyin))
+                }
+                db.insertWithOnConflict(TABLE_WORDS, null, values, SQLiteDatabase.CONFLICT_IGNORE)
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
         }
     }
 

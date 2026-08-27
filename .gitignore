@@ -22,6 +22,9 @@ local.properties
 # Kotlin daemon / build session data
 .kotlin/
 
+# 词库生成用的外部数据（pinyin-data 克隆）
+_data/
+
 # Android Studio profiler captures & heap dumps
 captures/
 *.hprof
