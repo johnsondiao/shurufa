@@ -5,7 +5,8 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 
-class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictionary.db", null, 5) {
+class DictionaryDatabase(private val appContext: Context) :
+    SQLiteOpenHelper(appContext, "dictionary.db", null, 5) {
 
     companion object {
         private const val TABLE_WORDS = "words"
@@ -721,7 +722,7 @@ class DictionaryDatabase(context: Context) : SQLiteOpenHelper(context, "dictiona
      */
     private fun loadAssetWords(db: SQLiteDatabase, assetName: String) {
         val lines = try {
-            context.assets.open(assetName).bufferedReader().use { it.readLines() }
+            appContext.assets.open(assetName).bufferedReader().use { it.readLines() }
         } catch (e: Exception) {
             return
         }
