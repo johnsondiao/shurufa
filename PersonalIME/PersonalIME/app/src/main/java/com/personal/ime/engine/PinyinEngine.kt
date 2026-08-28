@@ -13,7 +13,7 @@ import com.personal.ime.data.DictionaryDatabase
  */
 class PinyinEngine(private val database: DictionaryDatabase) {
 
-    /** components 仅整句候选使用：组成该句的各词，上屏时逐词学习词频 */
+    /** components 仅整句候选使用：存各组成词的拼音（如 "che"、"tui"），上屏时逐词学习词频 */
     data class Candidate(val text: String, val frequency: Int, val pinyin: String = "", val components: List<String> = emptyList())
 
     // T9 数字 -> 字母（用于候选栏拼音回显的分段计算）
@@ -171,7 +171,7 @@ class PinyinEngine(private val database: DictionaryDatabase) {
                                 prev.score + freq,
                                 prev.text + word,
                                 if (prev.pinyin.isEmpty()) pinyin else prev.pinyin + "'" + pinyin,
-                                prev.components + word
+                                prev.components + pinyin
                             )
                         )
                     }
@@ -401,9 +401,9 @@ class PinyinEngine(private val database: DictionaryDatabase) {
     /** 拼音 → T9 数字序列 */
     fun pinyinToDigits(pinyin: String): String = DictionaryDatabase.toDigits(pinyin)
 
-    /** 用户选词后提升词频 */
-    fun incrementFrequency(word: String) {
-        database.incrementFrequency(word)
+    /** 用户选词后提升词频：传入拼音定位词条 */
+    fun incrementFrequency(pinyin: String) {
+        database.incrementFrequency(pinyin)
     }
 
     fun addWord(pinyin: String, word: String) {

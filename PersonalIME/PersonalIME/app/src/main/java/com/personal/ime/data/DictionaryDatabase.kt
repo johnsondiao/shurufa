@@ -867,12 +867,12 @@ class DictionaryDatabase(private val appContext: Context) :
         return words
     }
 
-    /** 按词条提升词频（用户选词学习）。异步执行 + word 索引，不阻塞主线程 */
-    fun incrementFrequency(word: String) {
+    /** 按拼音提升词频（用户选词学习）。异步执行 + pinyin 索引，不阻塞主线程 */
+    fun incrementFrequency(pinyin: String) {
         ioScope.launch {
             writableDatabase.execSQL(
-                "UPDATE $TABLE_WORDS SET $COL_FREQ = $COL_FREQ + 1 WHERE $COL_WORD = ?",
-                arrayOf(word)
+                "UPDATE $TABLE_WORDS SET $COL_FREQ = $COL_FREQ + 1 WHERE $COL_PINYIN = ?",
+                arrayOf(pinyin)
             )
         }
     }

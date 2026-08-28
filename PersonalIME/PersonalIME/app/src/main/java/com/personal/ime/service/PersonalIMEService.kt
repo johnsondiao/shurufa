@@ -43,6 +43,13 @@ class PersonalIMEService : InputMethodService() {
     private var isPrivacyMode = false
     private var vibrationStrength = 30
     private var soundVolume = 20
+    private var keyboardHeightDp = 60f
+    private var keySizeSp = 16f
+    private var keyboardOffsetPx = 0
+
+    /** 按键间距随按键大小微调：默认 2dp，按键越大间距略增 */
+    private val keyMarginPx: Int
+        get() = (keySizeSp * 0.12f * resources.displayMetrics.density).toInt().coerceAtLeast(1)
 
     /** 临时英文模式：中文输入中点“英”切到 26 键，英文单词上屏后自动回到 9 键 */
     private var tempEnglish = false
@@ -100,6 +107,25 @@ class PersonalIMEService : InputMethodService() {
         serviceScope.launch {
             preferencesManager.soundVolume.collect { soundVolume = it }
         }
+        // 键盘尺寸设置：变化时重建键盘以应用新尺寸
+        serviceScope.launch {
+            preferencesManager.keyboardHeight.collect {
+                keyboardHeightDp = 44f + it * 28f / 100f
+                if (keyboardContainer != null) rebuildKeyboard()
+            }
+        }
+        serviceScope.launch {
+            preferencesManager.keySize.collect {
+                keySizeSp = 12f + it * 8f / 100f
+                if (keyboardContainer != null) rebuildKeyboard()
+            }
+        }
+        serviceScope.launch {
+            preferencesManager.keyboardOffset.collect {
+                keyboardOffsetPx = ((it - 50) * 0.4f * resources.displayMetrics.density).toInt()
+                if (keyboardContainer != null) rebuildKeyboard()
+            }
+        }
     }
 
     override fun onCreateInputView(): View {
@@ -114,6 +140,10 @@ class PersonalIMEService : InputMethodService() {
         rebuildKeyboard()
         return keyboardView
     }
+
+    /** 将 0-100 的设置值映射为实际尺寸（dp/sp） */
+    private fun mapSetting(value: Int, min: Float, max: Float): Float =
+        min + value * (max - min) / 100f
 
     // ==================== 键盘构建 ====================
 
@@ -140,6 +170,12 @@ class PersonalIMEService : InputMethodService() {
             pinyinSelectorScroll?.visibility = View.GONE
             pinyinSelector?.removeAllViews()
         }
+
+        // 键盘偏移：设置中的左右偏移量，通过容器外边距实现
+        val offset = keyboardOffsetPx
+        val leftMargin = if (offset > 0) offset else 0
+        val rightMargin = if (offset < 0) -offset else 0
+        (keyboardContainer?.layoutParams as? LinearLayout.LayoutParams)?.setMargins(leftMargin, 0, rightMargin, 0)
     }
 
     /**
@@ -289,7 +325,7 @@ class PersonalIMEService : InputMethodService() {
     // ==================== 按键工厂 ====================
 
     private fun createKeyboardRow(): LinearLayout {
-        val rowHeightPx = (60 * resources.displayMetrics.density).toInt()
+        val rowHeightPx = (keyboardHeightDp * resources.displayMetrics.density).toInt()
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
@@ -302,9 +338,9 @@ class PersonalIMEService : InputMethodService() {
     private fun createNarrowKey(label: String, onClick: () -> Unit): Button {
         return Button(this).apply {
             text = label
-            textSize = 16f
+            textSize = keySizeSp
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.6f).apply {
-                setMargins(2, 2, 2, 2)
+                setMargins(keyMarginPx, keyMarginPx, keyMarginPx, keyMarginPx)
             }
             setOnClickListener { onClick() }
         }
@@ -313,9 +349,9 @@ class PersonalIMEService : InputMethodService() {
     private fun createT9Key(label: String, digit: Char, onT9Click: (Char) -> Unit): Button {
         return Button(this).apply {
             text = label
-            textSize = 14f
+            textSize = keySizeSp
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
-                setMargins(2, 2, 2, 2)
+                setMargins(keyMarginPx, keyMarginPx, keyMarginPx, keyMarginPx)
             }
             setOnClickListener { onT9Click(digit) }
         }
@@ -324,9 +360,9 @@ class PersonalIMEService : InputMethodService() {
     private fun createSymbolKey(label: String, onClick: () -> Unit): Button {
         return Button(this).apply {
             text = label
-            textSize = 16f
+            textSize = keySizeSp
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
-                setMargins(2, 2, 2, 2)
+                setMargins(keyMarginPx, keyMarginPx, keyMarginPx, keyMarginPx)
             }
             setOnClickListener { onClick() }
         }
@@ -335,9 +371,9 @@ class PersonalIMEService : InputMethodService() {
     private fun createNumberKey(label: String, onClick: () -> Unit): Button {
         return Button(this).apply {
             text = label
-            textSize = 18f
+            textSize = keySizeSp + 2f
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
-                setMargins(2, 2, 2, 2)
+                setMargins(keyMarginPx, keyMarginPx, keyMarginPx, keyMarginPx)
             }
             setOnClickListener { onClick() }
         }
@@ -347,9 +383,9 @@ class PersonalIMEService : InputMethodService() {
         return Button(this).apply {
             tag = letter
             text = letter.toString()
-            textSize = 18f
+            textSize = keySizeSp + 2f
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
-                setMargins(2, 2, 2, 2)
+                setMargins(keyMarginPx, keyMarginPx, keyMarginPx, keyMarginPx)
             }
             setOnClickListener { handleLetterKey(letter) }
             qwertyLetterKeys.add(this)
@@ -359,9 +395,9 @@ class PersonalIMEService : InputMethodService() {
     private fun createSpecialKey(label: String, onClick: () -> Unit, weight: Float = 1f): Button {
         return Button(this).apply {
             text = label
-            textSize = 14f
+            textSize = keySizeSp - 2f
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, weight).apply {
-                setMargins(2, 2, 2, 2)
+                setMargins(keyMarginPx, keyMarginPx, keyMarginPx, keyMarginPx)
             }
             setOnClickListener { onClick() }
         }
@@ -770,11 +806,12 @@ class PersonalIMEService : InputMethodService() {
     private fun commitCandidate(candidate: PinyinEngine.Candidate) {
         currentInputConnection?.commitText(candidate.text, 1)
         if (!isPrivacyMode) {
-            // 整句候选不是词库词条，逐组成词学习；普通候选按整词学习
             if (candidate.components.isNotEmpty()) {
+                // 整句候选：components 存各组成词的拼音，逐词学习
                 candidate.components.forEach { pinyinEngine.incrementFrequency(it) }
-            } else {
-                pinyinEngine.incrementFrequency(candidate.text)
+            } else if (candidate.pinyin.isNotEmpty()) {
+                // 普通候选：按拼音学习（精确匹配该读音的词条）
+                pinyinEngine.incrementFrequency(candidate.pinyin)
             }
         }
         currentInput = ""
