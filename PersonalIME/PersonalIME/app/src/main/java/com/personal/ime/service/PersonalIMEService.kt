@@ -10,6 +10,7 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import com.personal.ime.data.ClipboardManager
 import com.personal.ime.data.DictionaryDatabase
@@ -49,6 +50,7 @@ class PersonalIMEService : InputMethodService() {
     private var keyboardContainer: LinearLayout? = null
     private var keyboardArea: LinearLayout? = null
     private var pinyinSelector: LinearLayout? = null
+    private var pinyinSelectorScroll: ScrollView? = null
     private var pinyinDisplay: TextView? = null
     private var candidateLayout: LinearLayout? = null
     private var candidateScrollView: HorizontalScrollView? = null
@@ -105,6 +107,7 @@ class PersonalIMEService : InputMethodService() {
         keyboardContainer = keyboardView.findViewById(com.personal.ime.R.id.keyboardContainer)
         keyboardArea = keyboardView.findViewById(com.personal.ime.R.id.keyboardArea)
         pinyinSelector = keyboardView.findViewById(com.personal.ime.R.id.pinyinSelector)
+        pinyinSelectorScroll = keyboardView.findViewById(com.personal.ime.R.id.pinyinSelectorScroll)
         pinyinDisplay = keyboardView.findViewById(com.personal.ime.R.id.pinyinDisplay)
         candidateLayout = keyboardView.findViewById(com.personal.ime.R.id.candidateLayout)
         candidateScrollView = keyboardView.findViewById(com.personal.ime.R.id.candidateScrollView)
@@ -551,7 +554,9 @@ class PersonalIMEService : InputMethodService() {
     private fun flushT9Pending() {
         if (currentInput.isEmpty()) return
         if (!database.isReady) return // 词库未就绪：保留输入，等加载完成后再上屏
-        val candidates = pinyinEngine.inputT9(currentInput)
+        // 与候选栏同一套过滤逻辑：选了拼音后空格上屏的是过滤后的首选，
+        // 否则会出现候选栏显示"汉"、空格却上屏"干"的不一致
+        val candidates = filteredCandidates()
         if (candidates.isNotEmpty()) {
             commitCandidate(candidates[0])
         } else {
@@ -588,7 +593,8 @@ class PersonalIMEService : InputMethodService() {
         
         // 清空拼音显示和选择列
         pinyinDisplay?.visibility = View.GONE
-        pinyinSelector?.visibility = View.GONE
+        pinyinSelectorScroll?.visibility = View.GONE
+        pinyinSelectorScroll?.scrollTo(0, 0)
         pinyinSelector?.removeAllViews()
         selectedPinyin = null
         
@@ -614,7 +620,7 @@ class PersonalIMEService : InputMethodService() {
 
             // 显示左侧拼音选择列（多个切分时）
             if (allSplits.size > 1) {
-                pinyinSelector?.visibility = View.VISIBLE
+                pinyinSelectorScroll?.visibility = View.VISIBLE
                 allSplits.forEach { py ->
                     pinyinSelector?.addView(createPinyinSelectorView(py, py == selected) {
                         selectPinyin(py)
@@ -622,11 +628,7 @@ class PersonalIMEService : InputMethodService() {
                 }
             }
 
-            // 根据选中的拼音过滤候选字（去空格/分隔符后前缀匹配，如 "ga o" 对应词库 "ga'o"）
-            val selKey = selected.replace(" ", "").replace("'", "")
-            val candidates = pinyinEngine.inputT9(currentInput)
-                .filter { it.pinyin.replace("'", "").startsWith(selKey) }
-                .take(10)
+            val candidates = filteredCandidates()
 
             candidates.forEachIndexed { index, candidate ->
                 candidatesView.addView(
@@ -643,19 +645,31 @@ class PersonalIMEService : InputMethodService() {
         }
     }
 
+    /** 按当前选中的拼音过滤候选（去空格/分隔符后前缀匹配，如 "ga o" 对应词库 "ga'o"） */
+    private fun filteredCandidates(): List<PinyinEngine.Candidate> {
+        val all = pinyinEngine.inputT9(currentInput)
+        val selected = selectedPinyin ?: return all
+        val selKey = selected.replace(" ", "").replace("'", "")
+        return all.filter { it.pinyin.replace("'", "").startsWith(selKey) }
+    }
+
     /** 选中某个拼音，刷新候选字（高亮由 updateCandidates 重建选择列时统一处理） */
     private fun selectPinyin(pinyin: String) {
         selectedPinyin = pinyin
         updateCandidates()
     }
 
-    /** 左侧拼音选择列的单项 */
+    /** 左侧拼音选择列的单项（固定高度，可滚动列内排列） */
     private fun createPinyinSelectorView(text: String, isSelected: Boolean, onClick: () -> Unit): TextView {
         return TextView(this).apply {
             this.text = text
             textSize = 14f
             gravity = Gravity.CENTER
-            setPadding(8, 12, 8, 12)
+            setPadding(8, 0, 8, 0)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                (40 * resources.displayMetrics.density).toInt()
+            )
             setBackgroundResource(
                 if (isSelected) com.personal.ime.R.drawable.candidate_highlight
                 else android.R.color.transparent

@@ -42,14 +42,21 @@
         android:orientation="horizontal"
         android:padding="4dp">
 
-        <!-- 左侧拼音选择列 -->
-        <LinearLayout
-            android:id="@+id/pinyinSelector"
-            android:layout_width="60dp"
-            android:layout_height="wrap_content"
-            android:orientation="vertical"
+        <!-- 左侧拼音选择列（可滚动，高度对齐键盘，避免撑高键盘） -->
+        <ScrollView
+            android:id="@+id/pinyinSelectorScroll"
+            android:layout_width="64dp"
+            android:layout_height="match_parent"
             android:background="#E8E8E8"
-            android:visibility="gone" />
+            android:scrollbars="none"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:id="@+id/pinyinSelector"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical" />
+        </ScrollView>
 
         <!-- 右侧键盘 -->
         <LinearLayout
