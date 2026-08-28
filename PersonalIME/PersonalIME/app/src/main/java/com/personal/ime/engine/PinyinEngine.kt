@@ -66,26 +66,21 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         }
         val plain = digits.filter { it != '\'' }
 
-        val merged = LinkedHashMap<String, Pair<Int, String>>()
+        // LinkedHashMap 保持插入序：恰好打完的词最先加入，排序时同层内稳定有序。
+        // key=词条，value=(词频, 拼音, matchTier)；tier 0=恰好打完 1=已打部分 2=续打更长，
+        // 主流输入法的第一规则：“打完的词置顶”，否则会被大量前缀词/高频单字淹没（如 撤退/词 打不出）
+        val merged = LinkedHashMap<String, Triple<Int, String, Int>>()
 
-        // 1) 续打匹配：词条数字序列以输入开头的词（含恰好等长的词）。
-        //    带 ' 时按强制音节边界过滤（如 94'26 只要 xi'an 类，排除 xian 类），
-        //    验证会淘汰部分候选，故多取一些再截断
-        database.queryByDigitsPrefix(plain, 48)
+        // 1) 恰好打完：数字与词条完全相等 —— 最高优先（如 243884 = 撤退）
+        database.queryByDigitsExact(plain, 16)
             .filter { (word, pinyin, _) ->
                 word.any { it in '\u4E00'..'\u9FFF' } && matchesBoundaries(pinyin, boundaries)
             }
-            .forEach { (word, pinyin, freq) ->
-                val existing = merged[word]
-                if (existing == null) {
-                    merged[word] = freq to pinyin
-                } else {
-                    merged[word] = (existing.first + freq) to pinyin
-                }
-            }
+            .forEach { (word, pinyin, freq) -> merged[word] = Triple(freq, pinyin, 0) }
 
-        // 2) 回退：从长到短找"恰好打完"的最长前缀，让已打完的短词在续打更长的词时仍可见
-        if (merged.size < CANDIDATE_LIMIT) {
+        // 2) 已打部分：从长到短找已完整输入的最长前缀，短词在续打时仍可见；
+        //    恰好打完有结果时跳过（避免短词抢占名额）
+        if (!merged.any { it.value.third == 0 }) {
             for (p in plain.length - 1 downTo 1) {
                 val exact = database.queryByDigitsExact(plain.substring(0, p), 16)
                     .filter { (word, pinyin, _) ->
@@ -93,23 +88,31 @@ class PinyinEngine(private val database: DictionaryDatabase) {
                     }
                 if (exact.isNotEmpty()) {
                     exact.forEach { (word, pinyin, freq) ->
-                        val existing = merged[word]
-                        if (existing == null) {
-                            merged[word] = freq to pinyin
-                        } else {
-                            merged[word] = (existing.first + freq) to pinyin
-                        }
+                        if (word !in merged) merged[word] = Triple(freq, pinyin, 1)
                     }
                     break
                 }
             }
         }
 
+        // 3) 续打匹配：数字序列以输入开头的更长词；已有更高优先级的词不降级覆盖，
+        //    多取一些再截断（边界验证会淘汰部分候选）
+        database.queryByDigitsPrefix(plain, 48)
+            .filter { (word, pinyin, _) ->
+                word.any { it in '\u4E00'..'\u9FFF' } && matchesBoundaries(pinyin, boundaries)
+            }
+            .forEach { (word, pinyin, freq) ->
+                if (word !in merged) merged[word] = Triple(freq, pinyin, 2)
+            }
+
         return merged.entries
             .map { Candidate(it.key, it.value.first, it.value.second) }
             .sortedWith(
-                // 词频降序；同频短词优先（打完整音节时二字词排在四字成语前）
-                compareByDescending<Candidate> { it.frequency }.thenBy { it.text.length }
+                // 匹配层级升序（打完的词置顶）；层内词频降序；同频短词优先。
+                // LinkedHashMap 插入序保证同层同频内“恰好打完”的词条稳定靠前。
+                compareBy<Candidate> { c -> merged[c.text]?.third ?: 2 }
+                    .thenByDescending { it.frequency }
+                    .thenBy { it.text.length }
             )
             .take(CANDIDATE_LIMIT)
     }
@@ -252,7 +255,9 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         dp[0].add("")
 
         for (i in 1..n) {
-            for (j in (maxOf(0, i - MAX_PINYIN_LEN) until i).reversed()) {
+            // 长段优先生成：完整音节（如 che）先于垃圾组合（如 ai+e）占用封顶名额，
+            // 否则正确读法会被短段组合挤出（如 243884 丢失 che tui）
+            for (j in maxOf(0, i - MAX_PINYIN_LEN) until i) {
                 if (dp[j].isEmpty()) continue
                 val matches = segmentPinyins(digits.substring(j, i))
                 if (matches.isEmpty()) continue
@@ -306,7 +311,7 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         /** 拼音最长字母数（zhuang/chuang = 6） */
         private const val MAX_PINYIN_LEN = 6
 
-        /** 拼音回显每个位置保留的分段数上限 */
-        private const val MAX_DISPLAY_SPLITS = 8
+        /** 拼音回显每个位置保留的分段数上限：太小会让正确读法被剪掉（如 che tui），16 兼顾质量与开销 */
+        private const val MAX_DISPLAY_SPLITS = 16
     }
 }

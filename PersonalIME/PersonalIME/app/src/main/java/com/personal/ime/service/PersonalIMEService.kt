@@ -612,7 +612,7 @@ class PersonalIMEService : InputMethodService() {
         // 英文模式：左侧列已由 rebuildKeyboard 隐藏，仅出候选
         if (inputMode != InputMode.CHINESE_T9) {
             if (currentInput.isNotEmpty()) {
-                englishEngine.predict(currentInput).take(10).forEachIndexed { index, word ->
+                englishEngine.predict(currentInput).take(20).forEachIndexed { index, word ->
                     val display = applyInputCase(word)
                     candidatesView.addView(
                         createCandidateView(display, index == 0) { commitEnglishWithAutoBack(display) }
@@ -701,7 +701,8 @@ class PersonalIMEService : InputMethodService() {
     private fun displayCandidates(): List<PinyinEngine.Candidate> {
         val sentences = pinyinEngine.sentenceCandidates(currentInput, 3)
         val singles = filteredCandidates()
-        return (sentences + singles).distinctBy { it.text }.take(10)
+        // 候选栏可横向滚动，多展示便于翻页找到被高频词排在后面的字（如“词”）
+        return (sentences + singles).distinctBy { it.text }.take(20)
     }
 
     /** 选中某个拼音，刷新候选字（高亮由 updateCandidates 重建选择列时统一处理） */
