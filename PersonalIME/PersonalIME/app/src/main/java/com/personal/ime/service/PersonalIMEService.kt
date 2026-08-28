@@ -710,12 +710,14 @@ class PersonalIMEService : InputMethodService() {
         updateCandidates()
     }
 
-    /** 左侧拼音选择列的单项（固定高度，可滚动列内排列） */
+    /** 左侧拼音选择列的单项（固定高度，可滚动列内排列；长拼音单行省略） */
     private fun createPinyinSelectorView(text: String, isSelected: Boolean, onClick: () -> Unit): TextView {
         return TextView(this).apply {
             this.text = text
             textSize = 14f
             gravity = Gravity.CENTER
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
             setPadding(8, 0, 8, 0)
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -769,7 +771,12 @@ class PersonalIMEService : InputMethodService() {
     private fun commitCandidate(candidate: PinyinEngine.Candidate) {
         currentInputConnection?.commitText(candidate.text, 1)
         if (!isPrivacyMode) {
-            pinyinEngine.incrementFrequency(candidate.text)
+            // 整句候选不是词库词条，逐组成词学习；普通候选按整词学习
+            if (candidate.components.isNotEmpty()) {
+                candidate.components.forEach { pinyinEngine.incrementFrequency(it) }
+            } else {
+                pinyinEngine.incrementFrequency(candidate.text)
+            }
         }
         currentInput = ""
         updateCandidates()

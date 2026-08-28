@@ -13,7 +13,8 @@ import com.personal.ime.data.DictionaryDatabase
  */
 class PinyinEngine(private val database: DictionaryDatabase) {
 
-    data class Candidate(val text: String, val frequency: Int, val pinyin: String = "")
+    /** components 仅整句候选使用：组成该句的各词，上屏时逐词学习词频 */
+    data class Candidate(val text: String, val frequency: Int, val pinyin: String = "", val components: List<String> = emptyList())
 
     // T9 数字 -> 字母（用于候选栏拼音回显的分段计算）
     private val digitLetters = mapOf(
@@ -119,24 +120,38 @@ class PinyinEngine(private val database: DictionaryDatabase) {
      * 让用户连续打字（不按空格断词）也能出多词组合候选。
      */
     fun sentenceCandidates(digits: String, limit: Int = 3): List<Candidate> {
+        // 分词键（'）切出强制音节边界：整句切分的词边界必须落在这些位置上，
+        // 与 inputT9 的边界语义保持一致（94'26 只出 xi'an 类组合，排除 xian 类）
+        val boundaries = mutableListOf<Int>()
+        var acc = 0
+        for (ch in digits) {
+            if (ch == '\'') {
+                if (acc > 0 && boundaries.lastOrNull() != acc) boundaries.add(acc)
+            } else {
+                acc++
+            }
+        }
         val plain = digits.filter { it != '\'' }
         val n = plain.length
         // 太短无组合意义；过长控制 DP 开销；词库未就绪不查
         if (n < 4 || n > 16 || !database.isReady) return emptyList()
 
         // segments 越少越优（倾向更长的词），同词数下词频总和越高越优
-        data class Path(val segments: Int, val score: Int, val text: String, val pinyin: String)
+        data class Path(val segments: Int, val score: Int, val text: String, val pinyin: String, val components: List<String>)
 
         val dp = Array(n + 1) { mutableListOf<Path>() }
-        dp[0].add(Path(0, 0, "", ""))
+        dp[0].add(Path(0, 0, "", "", emptyList()))
         val K = 3              // 每个位置保留的候选路径数（控制规模）
         val MAX_WORD_DIGITS = 8 // 单词数字长上限（涵盖绝大多数 2-4 字词）
         val WORDS_PER_SUB = 6   // 每个子串取的词条数上限
         val cmp = compareBy<Path>({ it.segments }, { -it.score })
 
         for (i in 1..n) {
-            val acc = mutableListOf<Path>()
+            val paths = mutableListOf<Path>()
             for (j in maxOf(0, i - MAX_WORD_DIGITS) until i) {
+                // 强制边界不能落在词内部：跨边界的 (j, i) 切分直接跳过，
+                // 这样合法切分必然在每个边界处断词
+                if (boundaries.any { it > j && it < i }) continue
                 val prevList = dp[j]
                 if (prevList.isEmpty()) continue
                 val sub = plain.substring(j, i)
@@ -145,24 +160,25 @@ class PinyinEngine(private val database: DictionaryDatabase) {
                 for (prev in prevList) {
                     for ((word, pinyin, freq) in words) {
                         if (!word.any { it in '\u4E00'..'\u9FFF' }) continue
-                        acc.add(
+                        paths.add(
                             Path(
                                 prev.segments + 1,
                                 prev.score + freq,
                                 prev.text + word,
-                                if (prev.pinyin.isEmpty()) pinyin else prev.pinyin + "'" + pinyin
+                                if (prev.pinyin.isEmpty()) pinyin else prev.pinyin + "'" + pinyin,
+                                prev.components + word
                             )
                         )
                     }
                 }
             }
-            dp[i] = acc.sortedWith(cmp).take(K).toMutableList()
+            dp[i] = paths.sortedWith(cmp).take(K).toMutableList()
         }
 
         // segments>=2 才是真正的“组合”（单词候选已由 inputT9 覆盖）
         return dp[n]
             .filter { it.segments >= 2 }
-            .map { Candidate(it.text, it.score, it.pinyin) }
+            .map { Candidate(it.text, it.score, it.pinyin, it.components) }
             .distinctBy { it.text }
             .take(limit)
     }

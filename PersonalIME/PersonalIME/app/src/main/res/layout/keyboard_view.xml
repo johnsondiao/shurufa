@@ -5,7 +5,7 @@
     android:orientation="vertical"
     android:background="@color/keyboard_bg_light">
 
-    <!-- 拼音回显行（单独一行） -->
+    <!-- 拼音回显行（单独一行；长句回显单行省略避免换行被裁） -->
     <TextView
         android:id="@+id/pinyinDisplay"
         android:layout_width="match_parent"
@@ -13,6 +13,9 @@
         android:background="@color/candidate_bg_light"
         android:gravity="center_vertical"
         android:paddingStart="16dp"
+        android:paddingEnd="16dp"
+        android:maxLines="1"
+        android:ellipsize="end"
         android:textSize="16sp"
         android:textStyle="bold"
         android:textColor="#1E8E3E"
