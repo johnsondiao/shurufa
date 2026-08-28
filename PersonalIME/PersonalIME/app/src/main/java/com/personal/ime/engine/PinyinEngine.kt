@@ -286,16 +286,70 @@ class PinyinEngine(private val database: DictionaryDatabase) {
 
         val full = fullSplits(digits)
         if (full.isNotEmpty()) {
-            return full.distinct()
-                .sortedBy { it.count { c -> c == ' ' } }  // 空格少的优先（切分少的 = 完整拼音）
-                .take(limit)
+            return rankSplits(full.distinct(), digits).take(limit)
         }
-        // 整串不可分段：回退到最长的可完整分段前缀
+        // 整串不可分段：回退到最长的可完整分段前缀（排序用同一前缀的数字串）
         for (i in digits.length - 1 downTo 1) {
-            val prefixSplits = fullSplits(digits.substring(0, i))
-            if (prefixSplits.isNotEmpty()) return prefixSplits.distinct().take(limit)
+            val prefix = digits.substring(0, i)
+            val prefixSplits = fullSplits(prefix)
+            if (prefixSplits.isNotEmpty()) return rankSplits(prefixSplits.distinct(), prefix).take(limit)
         }
         return emptyList()
+    }
+
+    /**
+     * 读法排序：音节数少的优先；同音节数内按“该读法实际能打出的首选字/词”词频降序（而非字母序），
+     * 读法顺序与用户选中后实际看到的候选一致（如 243884 的 che tui 因“撤”排前）。
+     */
+    private fun rankSplits(splits: List<String>, digits: String): List<String> {
+        if (splits.size <= 1) return splits
+        if (!database.isReady) return splits.sortedBy { it.count { c -> c == ' ' } }
+
+        // (数字子串, 音节) -> 该音节在该数字段下的代表字/词（词频最高）；
+        // 同一数字段常被多个读法共享，查询结果按音节缓存，总查询数有界（<=20 次索引查询）
+        val repCache = HashMap<String, Pair<String, Int>>()
+        fun representative(syllable: String, start: Int, end: Int): Pair<String, Int> =
+            repCache.getOrPut(syllable + "@" + start) {
+                val best = database.queryByDigitsExact(digits.substring(start, end), 40)
+                    .filter { (word, pinyin, _) ->
+                        word.any { it in '\u4E00'..'\u9FFF' } &&
+                                pinyin.replace("'", "") == syllable
+                    }
+                    .firstOrNull()
+                if (best != null) {
+                    best.first to best.third
+                } else {
+                    // 数字段下无该音节的字（理论上不应发生）：回退拼音前缀查询并降权，避免垃圾读法上位
+                    val top = database.queryWords(syllable, 1).firstOrNull()
+                    if (top != null) top.first to top.second - 40 else "" to 0
+                }
+            }
+
+        val score = HashMap<String, Int>(splits.size)
+        val repText = HashMap<String, String>(splits.size)
+        for (reading in splits) {
+            var total = 0
+            var pos = 0
+            val reps = StringBuilder()
+            for (syl in reading.split(' ')) {
+                val (w, f) = representative(syl, pos, pos + syl.length)
+                total += f
+                if (reps.isNotEmpty()) reps.append(' ')
+                reps.append(w)
+                pos += syl.length
+            }
+            // 整读法成词加成：读法本身就是词库词条时（如 che tui = 撤退），
+            // 加该词词频，使真词读法压过同音节数的非词读法（如 bie tui）
+            val fullWord = database.queryWords(reading.replace(" ", "'"), 1).firstOrNull()
+            if (fullWord != null) total += fullWord.second
+            score[reading] = total
+            repText[reading] = reps.toString()
+        }
+
+        // 音节数升序 -> 代表字/词词频降序 -> 代表文本字典序（排序稳定）
+        return splits.sortedWith(
+            compareBy({ it.count { c -> c == ' ' } }, { -(score[it] ?: 0) }, { repText[it] ?: "" })
+        )
     }
 
     /** 整串全部有效拼音分段（有界 DP；段长<=6，每位置封顶 MAX_DISPLAY_SPLITS） */
