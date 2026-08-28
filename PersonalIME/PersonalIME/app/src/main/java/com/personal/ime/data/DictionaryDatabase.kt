@@ -196,7 +196,6 @@ class DictionaryDatabase(private val appContext: Context) :
             "ip" to "IP",
             "dns" to "DNS",
             "cdn" to "CDN",
-            "api" to "API",
             "rpc" to "RPC",
             "ide" to "IDE",
             "vcs" to "VCS",
@@ -403,7 +402,6 @@ class DictionaryDatabase(private val appContext: Context) :
             "cuo" to "错",
             "zhen" to "真",
             "jia" to "假",
-            "hao" to "好",
             "huai" to "坏",
             "leng" to "冷",
             "re" to "热",
@@ -435,8 +433,6 @@ class DictionaryDatabase(private val appContext: Context) :
             "mu" to "木",
             "huo" to "火",
             "tu" to "土",
-            "jin" to "金",
-            "shui" to "水",
             "shan" to "山",
             "he" to "河",
             "hai" to "海",
@@ -446,7 +442,6 @@ class DictionaryDatabase(private val appContext: Context) :
             "quan" to "泉",
             "jing" to "井",
             "tian" to "田",
-            "di" to "地",
             "lu" to "路",
             "qiao" to "桥",
             "men" to "门",
@@ -544,9 +539,7 @@ class DictionaryDatabase(private val appContext: Context) :
             "zhengfu" to "政府",
             "xuexiao" to "学校",
             "zhongxue" to "中学",
-            "xiaoxue" to "小学",
             "youeryuan" to "幼儿园",
-            "daxue" to "大学",
             "yanjiusheng" to "研究生",
             "boshi" to "博士",
             "shuoshi" to "硕士",
@@ -630,8 +623,6 @@ class DictionaryDatabase(private val appContext: Context) :
             "waishengnv" to "外甥女",
             "sunzi" to "孙子",
             "sunnv" to "孙女",
-            "waigong" to "外公",
-            "waipo" to "外婆",
             "laogong" to "老公",
             "laopo" to "老婆",
             "zhangfu" to "丈夫",
@@ -728,7 +719,6 @@ class DictionaryDatabase(private val appContext: Context) :
             "xitong" to "系统",
             "caozuoxitong" to "操作系统",
             "anzhuo" to "安卓",
-            "pingguo" to "苹果",
             "huawei" to "华为",
             "xiaomi" to "小米",
             "oppo" to "OPPO",
@@ -829,6 +819,29 @@ class DictionaryDatabase(private val appContext: Context) :
     /** T9 精确匹配：数字序列与输入完全相等的词条 */
     fun queryByDigitsExact(digits: String, limit: Int): List<Triple<String, String, Int>> =
         queryByDigits("$COL_DIGITS = ?", digits, limit)
+
+    /** T9 精确匹配 + 拼音前缀过滤：用户在拼音选择列选了某个读法时使用。
+     *  拼音过滤下推到 DB（走 (pinyin, freq) 索引 + digits 等值双条件），
+     *  避免只在内存小窗口内过滤导致该读法的字被窗口截断。 */
+    fun queryByDigitsExactAndPinyin(digits: String, pinyinPrefix: String, limit: Int): List<Triple<String, String, Int>> {
+        val words = mutableListOf<Triple<String, String, Int>>()
+        val db = readableDatabase
+        val cursor = db.query(
+            TABLE_WORDS,
+            arrayOf(COL_WORD, COL_PINYIN, COL_FREQ),
+            "$COL_DIGITS = ? AND $COL_PINYIN GLOB ?",
+            arrayOf(digits, pinyinPrefix + "*"),
+            null, null,
+            "$COL_FREQ DESC",
+            limit.toString()
+        )
+        cursor.use {
+            while (it.moveToNext()) {
+                words.add(Triple(it.getString(0), it.getString(1), it.getInt(2)))
+            }
+        }
+        return words
+    }
 
     private fun queryByDigits(where: String, arg: String, limit: Int): List<Triple<String, String, Int>> {
         val words = mutableListOf<Triple<String, String, Int>>()

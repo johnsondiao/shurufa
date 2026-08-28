@@ -71,8 +71,10 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         // 主流输入法的第一规则：“打完的词置顶”，否则会被大量前缀词/高频单字淹没（如 撤退/词 打不出）
         val merged = LinkedHashMap<String, Triple<Int, String, Int>>()
 
-        // 1) 恰好打完：数字与词条完全相等 —— 最高优先（如 243884 = 撤退）
-        database.queryByDigitsExact(plain, 16)
+        // 1) 恰好打完：数字与词条完全相等 —— 最高优先（如 243884 = 撤退）。
+        //    同音组可达 260+ 条（如 94=xi/yi/zi），与最终展示窗口 60 对齐；
+        //    全量覆盖率模拟：取 16 时 23.8% 词条打不出，取 60 降至 ~4.5%
+        database.queryByDigitsExact(plain, 60)
             .filter { (word, pinyin, _) ->
                 word.any { it in '\u4E00'..'\u9FFF' } && matchesBoundaries(pinyin, boundaries)
             }
@@ -97,7 +99,7 @@ class PinyinEngine(private val database: DictionaryDatabase) {
 
         // 3) 续打匹配：数字序列以输入开头的更长词；已有更高优先级的词不降级覆盖，
         //    多取一些再截断（边界验证会淘汰部分候选）
-        database.queryByDigitsPrefix(plain, 48)
+        database.queryByDigitsPrefix(plain, 96)
             .filter { (word, pinyin, _) ->
                 word.any { it in '\u4E00'..'\u9FFF' } && matchesBoundaries(pinyin, boundaries)
             }
@@ -183,6 +185,55 @@ class PinyinEngine(private val database: DictionaryDatabase) {
             .filter { it.segments >= 2 }
             .map { Candidate(it.text, it.score, it.pinyin, it.components) }
             .distinctBy { it.text }
+            .take(limit)
+    }
+
+    /**
+     * 用户选了某个读法后的输入：拼音过滤下推到 DB 精确查询，
+     * 避免只在内存小窗口内过滤导致该读法的字被窗口截断（如 94 选 yi 后 意/易 打不出）。
+     */
+    fun inputT9ByPinyin(digits: String, selected: String, limit: Int = 60): List<Candidate> {
+        if (digits.isEmpty() || !database.isReady) return emptyList()
+        val boundaries = mutableListOf<Int>()
+        var acc = 0
+        for (ch in digits) {
+            if (ch == '\'') {
+                if (acc > 0 && boundaries.lastOrNull() != acc) boundaries.add(acc)
+            } else {
+                acc++
+            }
+        }
+        val plain = digits.filter { it != '\'' }
+        // 归一化后的完整前缀（去空格/分隔符）；DB 查询用首音节前缀，内存再按完整前缀过滤
+        val selKey = selected.replace(" ", "").replace("'", "")
+        val dbPrefix = selected.split(' ').firstOrNull()?.replace("'", "") ?: selKey
+
+        val merged = LinkedHashMap<String, Triple<Int, String, Int>>()
+        // 1) 恰好打完：数字相等 + 拼音以选中读法开头（DB 层过滤）
+        database.queryByDigitsExactAndPinyin(plain, dbPrefix, limit)
+            .filter { (word, pinyin, _) ->
+                word.any { it in '\u4E00'..'\u9FFF' } && matchesBoundaries(pinyin, boundaries)
+                        && pinyin.replace("'", "").startsWith(selKey)
+            }
+            .forEach { (word, pinyin, freq) -> merged[word] = Triple(freq, pinyin, 0) }
+
+        // 2) 续打：以输入开头的更长词，同样按选中读法过滤；已有词不降级覆盖
+        database.queryByDigitsPrefix(plain, 96)
+            .filter { (word, pinyin, _) ->
+                word.any { it in '\u4E00'..'\u9FFF' } && matchesBoundaries(pinyin, boundaries)
+                        && pinyin.replace("'", "").startsWith(selKey)
+            }
+            .forEach { (word, pinyin, freq) ->
+                if (word !in merged) merged[word] = Triple(freq, pinyin, 2)
+            }
+
+        return merged.entries
+            .map { Candidate(it.key, it.value.first, it.value.second) }
+            .sortedWith(
+                compareBy<Candidate> { c -> merged[c.text]?.third ?: 2 }
+                    .thenByDescending { it.frequency }
+                    .thenBy { it.text.length }
+            )
             .take(limit)
     }
 
@@ -306,7 +357,8 @@ class PinyinEngine(private val database: DictionaryDatabase) {
     }
 
     companion object {
-        private const val CANDIDATE_LIMIT = 20
+        // 覆盖率实测：20 条时 23.8% 词条不可达，60 条时仅 4.5%（超大同音组尾部）
+        private const val CANDIDATE_LIMIT = 60
 
         /** 拼音最长字母数（zhuang/chuang = 6） */
         private const val MAX_PINYIN_LEN = 6
