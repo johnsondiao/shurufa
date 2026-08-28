@@ -3,6 +3,7 @@ package com.personal.ime.service
 import android.graphics.Color
 import android.graphics.Typeface
 import android.inputmethodservice.InputMethodService
+import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
@@ -46,10 +47,16 @@ class PersonalIMEService : InputMethodService() {
     private var tempEnglish = false
 
     private var keyboardContainer: LinearLayout? = null
+    private var keyboardArea: LinearLayout? = null
+    private var pinyinSelector: LinearLayout? = null
+    private var pinyinDisplay: TextView? = null
     private var candidateLayout: LinearLayout? = null
     private var candidateScrollView: HorizontalScrollView? = null
     private var shiftKey: Button? = null
     private val qwertyLetterKeys = mutableListOf<Button>()
+
+    /** T9 模式下当前选中的拼音（用于过滤候选字） */
+    private var selectedPinyin: String? = null
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
@@ -96,6 +103,9 @@ class PersonalIMEService : InputMethodService() {
     override fun onCreateInputView(): View {
         val keyboardView = layoutInflater.inflate(com.personal.ime.R.layout.keyboard_view, null)
         keyboardContainer = keyboardView.findViewById(com.personal.ime.R.id.keyboardContainer)
+        keyboardArea = keyboardView.findViewById(com.personal.ime.R.id.keyboardArea)
+        pinyinSelector = keyboardView.findViewById(com.personal.ime.R.id.pinyinSelector)
+        pinyinDisplay = keyboardView.findViewById(com.personal.ime.R.id.pinyinDisplay)
         candidateLayout = keyboardView.findViewById(com.personal.ime.R.id.candidateLayout)
         candidateScrollView = keyboardView.findViewById(com.personal.ime.R.id.candidateScrollView)
         rebuildKeyboard()
@@ -105,7 +115,7 @@ class PersonalIMEService : InputMethodService() {
     // ==================== 键盘构建 ====================
 
     private fun rebuildKeyboard() {
-        val container = keyboardContainer ?: return
+        val container = keyboardArea ?: return
         container.removeAllViews()
         qwertyLetterKeys.clear()
         shiftKey = null
@@ -575,6 +585,13 @@ class PersonalIMEService : InputMethodService() {
         candidatesView.removeAllViews()
         // 新一轮候选从头展示，避免停留在上一次的横向滚动位置
         candidateScrollView?.scrollTo(0, 0)
+        
+        // 清空拼音显示和选择列
+        pinyinDisplay?.visibility = View.GONE
+        pinyinSelector?.visibility = View.GONE
+        pinyinSelector?.removeAllViews()
+        selectedPinyin = null
+        
         if (currentInput.isEmpty()) return
 
         // 首次建库导入期间不查库（readableDatabase 会阻塞到导入完成），提示用户稍候
@@ -584,11 +601,32 @@ class PersonalIMEService : InputMethodService() {
         }
 
         if (inputMode == InputMode.CHINESE_T9) {
-            // 拼音回显：显示默认切分（如 gao du），与主流输入法一致只展示一个
-            pinyinEngine.pinyinSplits(currentInput).take(1).forEach { py ->
-                candidatesView.addView(createPinyinView(py))
+            // 获取所有可能的拼音切分
+            val allSplits = pinyinEngine.pinyinSplits(currentInput, limit = 10)
+            if (allSplits.isEmpty()) return
+            
+            // 显示第一个拼音（默认选中）
+            val defaultPinyin = allSplits.first()
+            selectedPinyin = defaultPinyin
+            pinyinDisplay?.text = defaultPinyin
+            pinyinDisplay?.visibility = View.VISIBLE
+            
+            // 显示左侧拼音选择列（多个切分时）
+            if (allSplits.size > 1) {
+                pinyinSelector?.visibility = View.VISIBLE
+                allSplits.forEach { py ->
+                    pinyinSelector?.addView(createPinyinSelectorView(py, py == defaultPinyin) {
+                        selectPinyin(py)
+                    })
+                }
             }
-            pinyinEngine.inputT9(currentInput).take(10).forEachIndexed { index, candidate ->
+            
+            // 根据选中的拼音过滤候选字
+            val candidates = pinyinEngine.inputT9(currentInput)
+                .filter { selectedPinyin == null || it.pinyin.startsWith(selectedPinyin!!) }
+                .take(10)
+            
+            candidates.forEachIndexed { index, candidate ->
                 candidatesView.addView(
                     createCandidateView(candidate.text, index == 0) { commitCandidate(candidate) }
                 )
@@ -599,6 +637,47 @@ class PersonalIMEService : InputMethodService() {
                 candidatesView.addView(
                     createCandidateView(display, index == 0) { commitEnglishWithAutoBack(display) }
                 )
+            }
+        }
+    }
+
+    /** 选中某个拼音，刷新候选字 */
+    private fun selectPinyin(pinyin: String) {
+        selectedPinyin = pinyin
+        pinyinDisplay?.text = pinyin
+        // 高亮选中的拼音
+        pinyinSelector?.let { selector ->
+            for (i in 0 until selector.childCount) {
+                val view = selector.getChildAt(i) as? TextView
+                view?.let {
+                    val isSelected = it.text.toString() == pinyin
+                    it.setBackgroundResource(
+                        if (isSelected) com.personal.ime.R.drawable.candidate_highlight
+                        else android.R.color.transparent
+                    )
+                    it.setTextColor(if (isSelected) Color.WHITE else Color.BLACK)
+                }
+            }
+        }
+        // 刷新候选字
+        updateCandidates()
+    }
+
+    /** 左侧拼音选择列的单项 */
+    private fun createPinyinSelectorView(text: String, isSelected: Boolean, onClick: () -> Unit): TextView {
+        return TextView(this).apply {
+            this.text = text
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setPadding(8, 12, 8, 12)
+            setBackgroundResource(
+                if (isSelected) com.personal.ime.R.drawable.candidate_highlight
+                else android.R.color.transparent
+            )
+            setTextColor(if (isSelected) Color.WHITE else Color.BLACK)
+            setOnClickListener {
+                feedbackManager.vibrate(vibrationStrength)
+                onClick()
             }
         }
     }

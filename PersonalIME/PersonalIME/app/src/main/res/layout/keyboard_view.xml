@@ -5,7 +5,20 @@
     android:orientation="vertical"
     android:background="@color/keyboard_bg_light">
 
-    <!-- Candidate Bar -->
+    <!-- 拼音回显行（单独一行） -->
+    <TextView
+        android:id="@+id/pinyinDisplay"
+        android:layout_width="match_parent"
+        android:layout_height="36dp"
+        android:background="@color/candidate_bg_light"
+        android:gravity="center_vertical"
+        android:paddingStart="16dp"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:textColor="#1E8E3E"
+        android:visibility="gone" />
+
+    <!-- 候选字行（单独一行，横向滚动） -->
     <HorizontalScrollView
         android:id="@+id/candidateScrollView"
         android:layout_width="match_parent"
@@ -21,12 +34,30 @@
             android:padding="4dp" />
     </HorizontalScrollView>
 
-    <!-- Keyboard Container -->
+    <!-- 键盘区域（左侧拼音选择列 + 右侧按键） -->
     <LinearLayout
         android:id="@+id/keyboardContainer"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="vertical"
-        android:padding="4dp" />
+        android:orientation="horizontal"
+        android:padding="4dp">
+
+        <!-- 左侧拼音选择列 -->
+        <LinearLayout
+            android:id="@+id/pinyinSelector"
+            android:layout_width="60dp"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="#E8E8E8"
+            android:visibility="gone" />
+
+        <!-- 右侧键盘 -->
+        <LinearLayout
+            android:id="@+id/keyboardArea"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical" />
+    </LinearLayout>
 
 </LinearLayout>

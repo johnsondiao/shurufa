@@ -13,7 +13,7 @@ import com.personal.ime.data.DictionaryDatabase
  */
 class PinyinEngine(private val database: DictionaryDatabase) {
 
-    data class Candidate(val text: String, val frequency: Int)
+    data class Candidate(val text: String, val frequency: Int, val pinyin: String = "")
 
     // T9 数字 -> 字母（用于候选栏拼音回显的分段计算）
     private val digitLetters = mapOf(
@@ -65,7 +65,7 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         }
         val plain = digits.filter { it != '\'' }
 
-        val merged = LinkedHashMap<String, Int>()
+        val merged = LinkedHashMap<String, Pair<Int, String>>()
 
         // 1) 续打匹配：词条数字序列以输入开头的词（含恰好等长的词）。
         //    带 ' 时按强制音节边界过滤（如 94'26 只要 xi'an 类，排除 xian 类），
@@ -74,8 +74,13 @@ class PinyinEngine(private val database: DictionaryDatabase) {
             .filter { (word, pinyin, _) ->
                 word.any { it in '\u4E00'..'\u9FFF' } && matchesBoundaries(pinyin, boundaries)
             }
-            .forEach { (word, _, freq) ->
-                merged[word] = (merged[word] ?: 0) + freq
+            .forEach { (word, pinyin, freq) ->
+                val existing = merged[word]
+                if (existing == null) {
+                    merged[word] = freq to pinyin
+                } else {
+                    merged[word] = (existing.first + freq) to pinyin
+                }
             }
 
         // 2) 回退：从长到短找"恰好打完"的最长前缀，让已打完的短词在续打更长的词时仍可见
@@ -86,8 +91,13 @@ class PinyinEngine(private val database: DictionaryDatabase) {
                         word.any { it in '\u4E00'..'\u9FFF' } && matchesBoundaries(pinyin, boundaries)
                     }
                 if (exact.isNotEmpty()) {
-                    exact.forEach { (word, _, freq) ->
-                        merged[word] = (merged[word] ?: 0) + freq
+                    exact.forEach { (word, pinyin, freq) ->
+                        val existing = merged[word]
+                        if (existing == null) {
+                            merged[word] = freq to pinyin
+                        } else {
+                            merged[word] = (existing.first + freq) to pinyin
+                        }
                     }
                     break
                 }
@@ -95,7 +105,7 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         }
 
         return merged.entries
-            .map { Candidate(it.key, it.value) }
+            .map { Candidate(it.key, it.value.first, it.value.second) }
             .sortedWith(
                 // 词频降序；同频短词优先（打完整音节时二字词排在四字成语前）
                 compareByDescending<Candidate> { it.frequency }.thenBy { it.text.length }
