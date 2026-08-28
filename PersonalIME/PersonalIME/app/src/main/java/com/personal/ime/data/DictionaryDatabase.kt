@@ -4,9 +4,16 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 class DictionaryDatabase(private val appContext: Context) :
-    SQLiteOpenHelper(appContext, "dictionary.db", null, 8) {
+    SQLiteOpenHelper(appContext, "dictionary.db", null, 9) {
+
+    /** 词频学习等写操作放到 IO 线程，避免主线程卡顿（用户上屏每个词都会触发） */
+    private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     /** 词库是否已完成首次建库导入（未就绪时在 Service 展示提示，避免主线程阻塞） */
     @Volatile
@@ -69,6 +76,8 @@ class DictionaryDatabase(private val appContext: Context) :
         // （单列 digits 索引由本复合索引前缀覆盖，不再单独建）
         db.execSQL("CREATE INDEX idx_words_digits_freq ON $TABLE_WORDS($COL_DIGITS, $COL_FREQ DESC)")
         db.execSQL("CREATE INDEX idx_words_pinyin_freq ON $TABLE_WORDS($COL_PINYIN, $COL_FREQ DESC)")
+        // word 单列索引：词频学习按 word 更新，无此索引会全表扫描 40 万行卡死主线程
+        db.execSQL("CREATE INDEX idx_words_word ON $TABLE_WORDS($COL_WORD)")
 
         // Insert built-in tech terms
         insertTechTerms(db)
@@ -81,8 +90,16 @@ class DictionaryDatabase(private val appContext: Context) :
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        db.execSQL("DROP TABLE IF EXISTS $TABLE_WORDS")
-        onCreate(db)
+        if (oldVersion >= 8) {
+            // 8→9：仅补 word 列索引（词频学习按 word 更新），保留已导入词库，
+            // 避免 DROP 重建导致重新导入 40 万条（加载慢）
+            if (oldVersion < 9) {
+                db.execSQL("CREATE INDEX IF NOT EXISTS idx_words_word ON $TABLE_WORDS($COL_WORD)")
+            }
+        } else {
+            db.execSQL("DROP TABLE IF EXISTS $TABLE_WORDS")
+            onCreate(db)
+        }
     }
 
     private fun insertTechTerms(db: SQLiteDatabase) {
@@ -837,13 +854,14 @@ class DictionaryDatabase(private val appContext: Context) :
         return words
     }
 
-    /** 按词条提升词频（用户选词学习） */
+    /** 按词条提升词频（用户选词学习）。异步执行 + word 索引，不阻塞主线程 */
     fun incrementFrequency(word: String) {
-        val db = writableDatabase
-        db.execSQL(
-            "UPDATE $TABLE_WORDS SET $COL_FREQ = $COL_FREQ + 1 WHERE $COL_WORD = ?",
-            arrayOf(word)
-        )
+        ioScope.launch {
+            writableDatabase.execSQL(
+                "UPDATE $TABLE_WORDS SET $COL_FREQ = $COL_FREQ + 1 WHERE $COL_WORD = ?",
+                arrayOf(word)
+            )
+        }
     }
 
     fun insertWord(pinyin: String, word: String, frequency: Int = 1) {

@@ -128,6 +128,18 @@ class PersonalIMEService : InputMethodService() {
             keyboardPage == KeyboardPage.NUMBER -> buildNumberKeyboard(container)
             else -> buildT9Keyboard(container)
         }
+        // 左侧列仅 T9 主键盘显示，宽度恒定以避免键盘左右跳动；
+        // 默认填标点，输入后 updateCandidates 会按需换成拼音选择列。
+        // 符号/数字/英文页隐藏左侧列（符号页自带左侧标点列）。
+        val isT9Main = inputMode == InputMode.CHINESE_T9 && keyboardPage == KeyboardPage.T9
+        if (isT9Main) {
+            pinyinSelectorScroll?.visibility = View.VISIBLE
+            pinyinSelector?.removeAllViews()
+            populatePunctuationColumn()
+        } else {
+            pinyinSelectorScroll?.visibility = View.GONE
+            pinyinSelector?.removeAllViews()
+        }
     }
 
     /**
@@ -136,36 +148,34 @@ class PersonalIMEService : InputMethodService() {
      * 底行：符号  123  空格  中/英
      */
     private fun buildT9Keyboard(container: LinearLayout) {
-        // Row 1: , | 1'  ABC  DEF | ⌫
+        // 左侧标点列已移到独立的 pinyinSelector（无拼音时显示标点，避免键盘左右跳动），
+        // 故各行不再内嵌标点窄键，T9 键更宽。右侧仍为功能键。
+        // Row 1: 1'  ABC  DEF | ⌫
         val row1 = createKeyboardRow()
-        row1.addView(createNarrowKey("，", { commitPlainText("，") }))
         row1.addView(createT9Key("1'", '1', ::handleT9Separator))
         row1.addView(createT9Key("ABC", '2', ::handleT9Key))
         row1.addView(createT9Key("DEF", '3', ::handleT9Key))
         row1.addView(createSpecialKey("⌫", ::handleDelete))
         container.addView(row1)
 
-        // Row 2: / | GHI  JKL  MNO | 重输
+        // Row 2: GHI  JKL  MNO | 重输
         val row2 = createKeyboardRow()
-        row2.addView(createNarrowKey("/", { commitPlainText("/") }))
         row2.addView(createT9Key("GHI", '4', ::handleT9Key))
         row2.addView(createT9Key("JKL", '5', ::handleT9Key))
         row2.addView(createT9Key("MNO", '6', ::handleT9Key))
         row2.addView(createSpecialKey("重输", ::clearInput))
         container.addView(row2)
 
-        // Row 3: 。 | PQRS  TUV  WXYZ | 换行
+        // Row 3: PQRS  TUV  WXYZ | 换行
         val row3 = createKeyboardRow()
-        row3.addView(createNarrowKey("。", { commitPlainText("。") }))
         row3.addView(createT9Key("PQRS", '7', ::handleT9Key))
         row3.addView(createT9Key("TUV", '8', ::handleT9Key))
         row3.addView(createT9Key("WXYZ", '9', ::handleT9Key))
         row3.addView(createSpecialKey("换行", ::handleEnter))
         container.addView(row3)
 
-        // Row 4: ？ | 符号  123  空格  英  中/英（填满整行）
+        // Row 4: 符号  123  空格  英  中/英（填满整行）
         val row4 = createKeyboardRow()
-        row4.addView(createNarrowKey("？", { commitPlainText("？") }))
         row4.addView(createSpecialKey("符号", ::showSymbols))
         row4.addView(createSpecialKey("123", ::showNumbers))
         row4.addView(createSpecialKey("空格", { handleSpace() }, weight = 2f))
@@ -485,6 +495,8 @@ class PersonalIMEService : InputMethodService() {
         feedbackManager.vibrate(vibrationStrength)
         keyboardPage = KeyboardPage.T9
         rebuildKeyboard()
+        // 同步左侧列与候选（若有未提交输入，需重新展示拼音选择/标点）
+        updateCandidates()
     }
 
     /** 符号键盘翻页 */
@@ -590,60 +602,91 @@ class PersonalIMEService : InputMethodService() {
         candidatesView.removeAllViews()
         // 新一轮候选从头展示，避免停留在上一次的横向滚动位置
         candidateScrollView?.scrollTo(0, 0)
-        
-        // 清空拼音显示和选择列；先记住上一次选择，清空后再用它恢复选中项，
-        // 否则点击拼音列会被重置回第一项（上一轮的“保留选择”因这里置 null 而失效）
+
+        // 先记住上一次选择的拼音，清空后再用它恢复选中项（避免点击被重置回第一项）
         val previousSelection = selectedPinyin
         pinyinDisplay?.visibility = View.GONE
-        pinyinSelectorScroll?.visibility = View.GONE
         pinyinSelectorScroll?.scrollTo(0, 0)
         pinyinSelector?.removeAllViews()
         selectedPinyin = null
-        
-        if (currentInput.isEmpty()) return
 
-        // 首次建库导入期间不查库（readableDatabase 会阻塞到导入完成），提示用户稍候
+        // 英文模式：左侧列已由 rebuildKeyboard 隐藏，仅出候选
+        if (inputMode != InputMode.CHINESE_T9) {
+            if (currentInput.isNotEmpty()) {
+                englishEngine.predict(currentInput).take(10).forEachIndexed { index, word ->
+                    val display = applyInputCase(word)
+                    candidatesView.addView(
+                        createCandidateView(display, index == 0) { commitEnglishWithAutoBack(display) }
+                    )
+                }
+            }
+            return
+        }
+
+        // T9 模式：左侧列始终占位（宽度恒定，避免键盘左右跳动）
+        pinyinSelectorScroll?.visibility = View.VISIBLE
+
+        // 词库未就绪：左侧显示标点，候选栏提示加载中（不查库避免阻塞主线程）
         if (!database.isReady) {
+            populatePunctuationColumn()
             candidatesView.addView(createPinyinView("词库加载中…"))
             return
         }
 
-        if (inputMode == InputMode.CHINESE_T9) {
-            // 获取所有可能的拼音切分
-            val allSplits = pinyinEngine.pinyinSplits(currentInput, limit = 10)
-            if (allSplits.isEmpty()) return
+        // 无输入：左侧显示标点（就像参考设计的标点列）
+        if (currentInput.isEmpty()) {
+            populatePunctuationColumn()
+            return
+        }
 
-            // 保留用户已选的拼音（若仍在新切分列表中），否则默认选第一个。
-            // 注意要用清空前保存的 previousSelection，不能用已被置 null 的 selectedPinyin
+        val allSplits = pinyinEngine.pinyinSplits(currentInput, limit = 10)
+        if (allSplits.size > 1) {
+            // 多种读法：左侧显示拼音选择列；保留用户已选项（若仍在列表中）
             val selected = previousSelection?.takeIf { it in allSplits } ?: allSplits.first()
             selectedPinyin = selected
             pinyinDisplay?.text = selected
             pinyinDisplay?.visibility = View.VISIBLE
-
-            // 显示左侧拼音选择列（多个切分时）
-            if (allSplits.size > 1) {
-                pinyinSelectorScroll?.visibility = View.VISIBLE
-                allSplits.forEach { py ->
-                    pinyinSelector?.addView(createPinyinSelectorView(py, py == selected) {
-                        selectPinyin(py)
-                    })
-                }
-            }
-
-            val candidates = filteredCandidates()
-
-            candidates.forEachIndexed { index, candidate ->
-                candidatesView.addView(
-                    createCandidateView(candidate.text, index == 0) { commitCandidate(candidate) }
-                )
+            allSplits.forEach { py ->
+                pinyinSelector?.addView(createPinyinSelectorView(py, py == selected) {
+                    selectPinyin(py)
+                })
             }
         } else {
-            englishEngine.predict(currentInput).take(10).forEachIndexed { index, word ->
-                val display = applyInputCase(word)
-                candidatesView.addView(
-                    createCandidateView(display, index == 0) { commitEnglishWithAutoBack(display) }
-                )
+            // 唯一读法或无法切分：左侧回落到标点列，拼音回显仍展示在顶行
+            populatePunctuationColumn()
+            allSplits.firstOrNull()?.let {
+                pinyinDisplay?.text = it
+                pinyinDisplay?.visibility = View.VISIBLE
             }
+        }
+
+        val candidates = filteredCandidates()
+        candidates.forEachIndexed { index, candidate ->
+            candidatesView.addView(
+                createCandidateView(candidate.text, index == 0) { commitCandidate(candidate) }
+            )
+        }
+    }
+
+    /** 左侧列无拼音选择时的默认内容：常用标点（宽度恒定，避免键盘左右跳动） */
+    private fun populatePunctuationColumn() {
+        arrayOf("，", "/", "。", "？").forEach { p ->
+            pinyinSelector?.addView(createPunctuationKey(p))
+        }
+    }
+
+    /** 左侧标点列单项（高度对齐键盘行，点击直接上屏标点） */
+    private fun createPunctuationKey(text: String): TextView {
+        return TextView(this).apply {
+            this.text = text
+            textSize = 18f
+            gravity = Gravity.CENTER
+            setBackgroundResource(com.personal.ime.R.drawable.key_bg_selector)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                (60 * resources.displayMetrics.density).toInt()
+            )
+            setOnClickListener { commitPlainText(text) }
         }
     }
 
