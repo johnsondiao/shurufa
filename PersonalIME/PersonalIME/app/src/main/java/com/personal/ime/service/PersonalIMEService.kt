@@ -591,7 +591,9 @@ class PersonalIMEService : InputMethodService() {
         // 新一轮候选从头展示，避免停留在上一次的横向滚动位置
         candidateScrollView?.scrollTo(0, 0)
         
-        // 清空拼音显示和选择列
+        // 清空拼音显示和选择列；先记住上一次选择，清空后再用它恢复选中项，
+        // 否则点击拼音列会被重置回第一项（上一轮的“保留选择”因这里置 null 而失效）
+        val previousSelection = selectedPinyin
         pinyinDisplay?.visibility = View.GONE
         pinyinSelectorScroll?.visibility = View.GONE
         pinyinSelectorScroll?.scrollTo(0, 0)
@@ -612,8 +614,8 @@ class PersonalIMEService : InputMethodService() {
             if (allSplits.isEmpty()) return
 
             // 保留用户已选的拼音（若仍在新切分列表中），否则默认选第一个。
-            // 不保留会导致点击拼音列被重置回第一项，看起来像“点不动”
-            val selected = selectedPinyin?.takeIf { it in allSplits } ?: allSplits.first()
+            // 注意要用清空前保存的 previousSelection，不能用已被置 null 的 selectedPinyin
+            val selected = previousSelection?.takeIf { it in allSplits } ?: allSplits.first()
             selectedPinyin = selected
             pinyinDisplay?.text = selected
             pinyinDisplay?.visibility = View.VISIBLE
