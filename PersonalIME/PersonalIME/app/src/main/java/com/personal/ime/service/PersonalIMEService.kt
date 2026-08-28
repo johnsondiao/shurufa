@@ -63,8 +63,8 @@ class PersonalIMEService : InputMethodService() {
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     companion object {
-        /** T9 未提交数字串最大长度 */
-        private const val MAX_T9_PENDING = 12
+        /** T9 未提交数字串最大长度（支持整句连续打字，放宽到 20） */
+        private const val MAX_T9_PENDING = 20
     }
 
     // 符号键盘三页内容
@@ -566,9 +566,8 @@ class PersonalIMEService : InputMethodService() {
     private fun flushT9Pending() {
         if (currentInput.isEmpty()) return
         if (!database.isReady) return // 词库未就绪：保留输入，等加载完成后再上屏
-        // 与候选栏同一套过滤逻辑：选了拼音后空格上屏的是过滤后的首选，
-        // 否则会出现候选栏显示"汉"、空格却上屏"干"的不一致
-        val candidates = filteredCandidates()
+        // 与候选栏同一套列表：空格上屏的就是候选栏首选（整句组合优先），所见即所得
+        val candidates = displayCandidates()
         if (candidates.isNotEmpty()) {
             commitCandidate(candidates[0])
         } else {
@@ -660,7 +659,7 @@ class PersonalIMEService : InputMethodService() {
             }
         }
 
-        val candidates = filteredCandidates()
+        val candidates = displayCandidates()
         candidates.forEachIndexed { index, candidate ->
             candidatesView.addView(
                 createCandidateView(candidate.text, index == 0) { commitCandidate(candidate) }
@@ -696,6 +695,13 @@ class PersonalIMEService : InputMethodService() {
         val selected = selectedPinyin ?: return all
         val selKey = selected.replace(" ", "").replace("'", "")
         return all.filter { it.pinyin.replace("'", "").startsWith(selKey) }
+    }
+
+    /** 展示/上屏用候选：整句组合候选在前，其次按选中拼音过滤的单词候选（两者去重） */
+    private fun displayCandidates(): List<PinyinEngine.Candidate> {
+        val sentences = pinyinEngine.sentenceCandidates(currentInput, 3)
+        val singles = filteredCandidates()
+        return (sentences + singles).distinctBy { it.text }.take(10)
     }
 
     /** 选中某个拼音，刷新候选字（高亮由 updateCandidates 重建选择列时统一处理） */

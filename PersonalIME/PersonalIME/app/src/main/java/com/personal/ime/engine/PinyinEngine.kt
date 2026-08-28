@@ -114,6 +114,60 @@ class PinyinEngine(private val database: DictionaryDatabase) {
     }
 
     /**
+     * 整句/组合候选：把整串数字切分成若干词库词条的组合（覆盖全部输入）。
+     * 如 548744... -> “就是完整的”。用 DP 找“词数最少、词频最高”的若干切分，
+     * 让用户连续打字（不按空格断词）也能出多词组合候选。
+     */
+    fun sentenceCandidates(digits: String, limit: Int = 3): List<Candidate> {
+        val plain = digits.filter { it != '\'' }
+        val n = plain.length
+        // 太短无组合意义；过长控制 DP 开销；词库未就绪不查
+        if (n < 4 || n > 16 || !database.isReady) return emptyList()
+
+        // segments 越少越优（倾向更长的词），同词数下词频总和越高越优
+        data class Path(val segments: Int, val score: Int, val text: String, val pinyin: String)
+
+        val dp = Array(n + 1) { mutableListOf<Path>() }
+        dp[0].add(Path(0, 0, "", ""))
+        val K = 3              // 每个位置保留的候选路径数（控制规模）
+        val MAX_WORD_DIGITS = 8 // 单词数字长上限（涵盖绝大多数 2-4 字词）
+        val WORDS_PER_SUB = 6   // 每个子串取的词条数上限
+        val cmp = compareBy<Path>({ it.segments }, { -it.score })
+
+        for (i in 1..n) {
+            val acc = mutableListOf<Path>()
+            for (j in maxOf(0, i - MAX_WORD_DIGITS) until i) {
+                val prevList = dp[j]
+                if (prevList.isEmpty()) continue
+                val sub = plain.substring(j, i)
+                val words = database.queryByDigitsExact(sub, WORDS_PER_SUB)
+                if (words.isEmpty()) continue
+                for (prev in prevList) {
+                    for ((word, pinyin, freq) in words) {
+                        if (!word.any { it in '\u4E00'..'\u9FFF' }) continue
+                        acc.add(
+                            Path(
+                                prev.segments + 1,
+                                prev.score + freq,
+                                prev.text + word,
+                                if (prev.pinyin.isEmpty()) pinyin else prev.pinyin + "'" + pinyin
+                            )
+                        )
+                    }
+                }
+            }
+            dp[i] = acc.sortedWith(cmp).take(K).toMutableList()
+        }
+
+        // segments>=2 才是真正的“组合”（单词候选已由 inputT9 覆盖）
+        return dp[n]
+            .filter { it.segments >= 2 }
+            .map { Candidate(it.text, it.score, it.pinyin) }
+            .distinctBy { it.text }
+            .take(limit)
+    }
+
+    /**
      * 强制音节边界验证：候选拼音的音节切分须覆盖输入的所有边界位置。
      * - 带 ' 的拼音（资产词）：音节边界由数据源确定，严格校验
      * - 连写拼音（精编词/单字）：允许任意有效音节切分覆盖边界（DP）
