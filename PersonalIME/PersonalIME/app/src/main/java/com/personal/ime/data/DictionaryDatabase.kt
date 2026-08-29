@@ -59,6 +59,10 @@ class DictionaryDatabase(private val appContext: Context) :
 
         /** 词语/成字词库资产文件（汉典成语 + 2-4 字词组，约 16 万条） */
         private const val ASSET_CN_WORDS = "cn_words.txt"
+
+        /** 用户词保护档：用户打过的词直接跳入此档，压过所有基础档位（手编词 90/单字 85/词组 50），
+         *  之后再打则在档内 +1，几次即可稳定置顶 */
+        private const val USER_TIER = 95
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -867,11 +871,12 @@ class DictionaryDatabase(private val appContext: Context) :
         return words
     }
 
-    /** 按拼音提升词频（用户选词学习）。异步执行 + pinyin 索引，不阻塞主线程 */
+    /** 按拼音提升词频（用户选词学习）。异步执行 + pinyin 索引，不阻塞主线程。
+     *  用户词保护档：词频低于 USER_TIER 时直接跳档（一次上屏即可置顶），已入档则继续 +1 */
     fun incrementFrequency(pinyin: String) {
         ioScope.launch {
             writableDatabase.execSQL(
-                "UPDATE $TABLE_WORDS SET $COL_FREQ = $COL_FREQ + 1 WHERE $COL_PINYIN = ?",
+                "UPDATE $TABLE_WORDS SET $COL_FREQ = CASE WHEN $COL_FREQ < $USER_TIER THEN $USER_TIER ELSE $COL_FREQ + 1 END WHERE $COL_PINYIN = ?",
                 arrayOf(pinyin)
             )
         }
