@@ -141,7 +141,9 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         // 太短无组合意义；过长控制 DP 开销；词库未就绪不查
         if (n < 4 || n > 16 || !database.isReady) return emptyList()
 
-        // segments 越少越优（倾向更长的词），同词数下词频总和越高越优
+        // 得分 = 段均词频 + 数字长度加成：高频组合优先，且不会让低频单字词组（如 嗚嗚）
+        // 靠“段数少”挤掉高频两段组合（如 给我=85+90）——旧规则“段数优先”曾导致 给我 打不出。
+        // 同分时保留段数少者优先（倾向整词）
         data class Path(val segments: Int, val score: Int, val text: String, val pinyin: String, val components: List<String>)
 
         val dp = Array(n + 1) { mutableListOf<Path>() }
@@ -149,7 +151,10 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         val K = 3              // 每个位置保留的候选路径数（控制规模）
         val MAX_WORD_DIGITS = 8 // 单词数字长上限（涵盖绝大多数 2-4 字词）
         val WORDS_PER_SUB = 6   // 每个子串取的词条数上限
-        val cmp = compareBy<Path>({ it.segments }, { -it.score })
+        val cmp = compareByDescending<Path> { p ->
+            if (p.segments == 0) 0
+            else (p.score / p.segments) + n
+        }.thenBy { it.segments }
 
         for (i in 1..n) {
             val paths = mutableListOf<Path>()

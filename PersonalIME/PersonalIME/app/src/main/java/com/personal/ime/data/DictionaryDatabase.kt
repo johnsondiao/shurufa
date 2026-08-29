@@ -10,7 +10,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 class DictionaryDatabase(private val appContext: Context) :
-    SQLiteOpenHelper(appContext, "dictionary.db", null, 9) {
+    SQLiteOpenHelper(appContext, "dictionary.db", null, 10) {
 
     /** 词频学习等写操作放到 IO 线程，避免主线程卡顿（用户上屏每个词都会触发） */
     private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -86,6 +86,9 @@ class DictionaryDatabase(private val appContext: Context) :
         // Insert built-in tech terms
         insertTechTerms(db)
 
+        // Insert 高频动宾短语种子（词组资产缺失的日常刚需词，如 给我）
+        insertPhraseSeeds(db)
+
         // Insert 《通用规范汉字表》单字（覆盖新华字典全部汉字）
         loadAssetWords(db, ASSET_CN_CHARS)
 
@@ -100,9 +103,36 @@ class DictionaryDatabase(private val appContext: Context) :
             if (oldVersion < 9) {
                 db.execSQL("CREATE INDEX IF NOT EXISTS idx_words_word ON $TABLE_WORDS($COL_WORD)")
             }
+            // 9→10：补录高频短语种子（存量词库不重建，仅追加新词条）
+            if (oldVersion < 10) {
+                insertPhraseSeeds(db)
+            }
         } else {
             db.execSQL("DROP TABLE IF EXISTS $TABLE_WORDS")
             onCreate(db)
+        }
+    }
+
+    /**
+     * 高频动宾短语种子：词组资产没有但日常必打（如 给我），且整句组合易被单字词组挤掉。
+     * 独立于 commonWords，便于升级路径对存量词库补录（db.insert 遇 UNIQUE 冲突返回 -1，静默跳过）
+     */
+    private fun insertPhraseSeeds(db: SQLiteDatabase) {
+        val phrases = mapOf(
+            "geiwo" to "给我",
+            "geini" to "给你",
+            "geita" to "给他",
+            "geitamen" to "给他们",
+            "geiwomen" to "给我们"
+        )
+        phrases.forEach { (pinyin, word) ->
+            val values = ContentValues().apply {
+                put(COL_PINYIN, pinyin)
+                put(COL_WORD, word)
+                put(COL_FREQ, 90)
+                put(COL_DIGITS, toDigits(pinyin))
+            }
+            db.insert(TABLE_WORDS, null, values)
         }
     }
 
