@@ -812,11 +812,12 @@ class PersonalIMEService : InputMethodService() {
         }
     }
 
-    /** 左侧列无拼音选择时的默认内容：常用标点（宽度恒定，避免键盘左右跳动） */
+    /** 左侧列无拼音选择时的默认内容：常用标点 + 隐私开关（宽度恒定，避免键盘左右跳动） */
     private fun populatePunctuationColumn() {
         arrayOf("，", "/", "。", "？").forEach { p ->
             pinyinSelector?.addView(createPunctuationKey(p))
         }
+        pinyinSelector?.addView(createPrivacyKey())
     }
 
     /** 左侧标点列单项（高度对齐键盘行，点击直接上屏标点） */
@@ -831,6 +832,33 @@ class PersonalIMEService : InputMethodService() {
                 (60 * resources.displayMetrics.density).toInt()
             )
             setOnClickListener { commitPlainText(text) }
+        }
+    }
+
+    /** 隐私模式开关（左侧列底部）：开启时高亮显示，点击切换 */
+    private fun createPrivacyKey(): TextView {
+        return TextView(this).apply {
+            text = if (isPrivacyMode) "隐✓" else "隐"
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setTextColor(if (isPrivacyMode) Color.WHITE else Color.BLACK)
+            setBackgroundResource(
+                if (isPrivacyMode) com.personal.ime.R.drawable.candidate_highlight
+                else com.personal.ime.R.drawable.key_bg_selector
+            )
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                (60 * resources.displayMetrics.density).toInt()
+            )
+            setOnClickListener {
+                feedbackManager.vibrate(vibrationStrength)
+                val newState = !isPrivacyMode
+                isPrivacyMode = newState
+                serviceScope.launch { preferencesManager.setPrivacyMode(newState) }
+                // 刷新左侧列以更新按钮外观（高亮/普通）
+                pinyinSelector?.removeAllViews()
+                populatePunctuationColumn()
+            }
         }
     }
 
