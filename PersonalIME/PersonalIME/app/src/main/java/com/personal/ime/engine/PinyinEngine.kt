@@ -396,6 +396,22 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         return combos.filter { it in validPinyins }
     }
 
+    /**
+     * 联想候选（模拟主流输入法上屏后的下文推荐）：
+     * 返回词库中以已上屏词为前缀的更长词条（如 中国 -> 中国人/中国梦）。
+     * 无语言模型下的实用近似：16 万词组中同前缀长词覆盖常见搭配。
+     */
+    fun associate(base: String): List<Candidate> {
+        if (base.isEmpty() || !database.isReady) return emptyList()
+        if (!base.any { it in '\u4E00'..'\u9FFF' }) return emptyList()
+        return database.queryWordsByPrefix(base, 30)
+            .filter { (word, _, _) ->
+                word.any { it in '\u4E00'..'\u9FFF' } && word.length <= base.length + 4
+            }
+            .map { (word, pinyin, freq) -> Candidate(word, freq, pinyin) }
+            .take(20)
+    }
+
     fun inputFullPinyin(pinyin: String): List<Candidate> {
         if (pinyin.isEmpty()) return emptyList()
 

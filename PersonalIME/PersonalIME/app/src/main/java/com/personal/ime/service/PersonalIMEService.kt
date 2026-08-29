@@ -19,6 +19,7 @@ import com.personal.ime.data.DictionaryDatabase
 import com.personal.ime.data.PreferencesManager
 import com.personal.ime.engine.EnglishEngine
 import com.personal.ime.engine.PinyinEngine
+import com.personal.ime.util.EmojiData
 import com.personal.ime.util.FeedbackManager
 import kotlinx.coroutines.*
 
@@ -77,6 +78,12 @@ class PersonalIMEService : InputMethodService() {
 
     /** T9 模式下当前选中的拼音（用于过滤候选字） */
     private var selectedPinyin: String? = null
+
+    /** 联想候选：上屏中文词后展示以它开头的更长词（模拟主流输入法下文推荐） */
+    private var associationCandidates: List<PinyinEngine.Candidate> = emptyList()
+
+    /** 表情面板浮层（底行 表情 键弹出，点表情上屏且面板保持打开） */
+    private var emojiPopup: PopupWindow? = null
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
@@ -164,6 +171,7 @@ class PersonalIMEService : InputMethodService() {
 
     private fun rebuildKeyboard() {
         dismissClipboardPopup()
+        dismissEmojiPanel()
         val container = keyboardArea ?: return
         container.removeAllViews()
         qwertyLetterKeys.clear()
@@ -226,12 +234,13 @@ class PersonalIMEService : InputMethodService() {
         row3.addView(createSpecialKey("换行", ::handleEnter))
         container.addView(row3)
 
-        // Row 4: 符号  123  剪  空格  英  中/英（填满整行）
+        // Row 4: 符号  123  剪  表情  空格  英  中/英（填满整行）
         val row4 = createKeyboardRow()
         row4.addView(createSpecialKey("符号", ::showSymbols))
         row4.addView(createSpecialKey("123", ::showNumbers))
         row4.addView(createSpecialKey("剪", ::showClipboard, weight = 0.8f))
-        row4.addView(createSpecialKey("空格", { handleSpace() }, weight = 1.8f))
+        row4.addView(createSpecialKey("表情", ::toggleEmojiPanel, weight = 0.9f))
+        row4.addView(createSpecialKey("空格", { handleSpace() }, weight = 1.4f))
         row4.addView(createSpecialKey("英", ::switchToEnglishTemp, weight = 0.8f))
         row4.addView(createSpecialKey(modeLabel(), ::toggleInputMode))
         container.addView(row4)
@@ -371,6 +380,12 @@ class PersonalIMEService : InputMethodService() {
                 setMargins(keyMarginPx, keyMarginPx, keyMarginPx, keyMarginPx)
             }
             setOnClickListener { onT9Click(digit) }
+            // 长按直接上屏对应数字（主流九键标准交互，免切 123 键盘）
+            setOnLongClickListener {
+                feedbackManager.vibrate(vibrationStrength)
+                commitPlainText(digit.toString())
+                true
+            }
         }
     }
 
@@ -424,7 +439,8 @@ class PersonalIMEService : InputMethodService() {
 
     private fun handleT9Key(digit: Char) {
         // 限制未提交数字串长度，避免长序列候选计算拖慢键盘；数字 0 请走 123 键盘
-        // 分隔符 ' 不计入长度
+        // 分隔符 ' 不计入长度；开始新一轮输入时清空联想候选
+        associationCandidates = emptyList()
         if (currentInput.count { it != '\'' } >= MAX_T9_PENDING) return
         feedbackManager.vibrate(vibrationStrength)
         currentInput += digit
@@ -433,6 +449,7 @@ class PersonalIMEService : InputMethodService() {
 
     /** T9 分词键（1 键）：在数字串中插入音节分隔符，强制切分如 94'26 = xi'an */
     private fun handleT9Separator(digit: Char) {
+        associationCandidates = emptyList()
         feedbackManager.vibrate(vibrationStrength)
         // 不能开头、不能连续（仅在已有数字且末尾是数字时插入）
         if (currentInput.isEmpty() || currentInput.last() == '\'') return
@@ -637,6 +654,70 @@ class PersonalIMEService : InputMethodService() {
         }
     }
 
+    // ==================== 表情面板 ====================
+
+    /** 切换表情面板：已打开则关闭，未打开则展示 */
+    private fun toggleEmojiPanel() {
+        feedbackManager.vibrate(vibrationStrength)
+        if (emojiPopup?.isShowing == true) {
+            dismissEmojiPanel()
+            return
+        }
+        showEmojiPanel()
+    }
+
+    /** 表情面板：8 列网格，点击上屏且面板保持打开（可连续发表情） */
+    private fun showEmojiPanel() {
+        val anchor = keyboardContainer ?: return
+        val density = resources.displayMetrics.density
+
+        val grid = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding((4 * density).toInt(), (8 * density).toInt(), (4 * density).toInt(), (8 * density).toInt())
+        }
+        EmojiData.commonEmojis.chunked(8).forEach { rowEmojis ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    (44 * density).toInt()
+                )
+            }
+            rowEmojis.forEach { emoji ->
+                row.addView(TextView(this).apply {
+                    text = emoji
+                    textSize = 22f
+                    gravity = Gravity.CENTER
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+                    // 只上屏不刷新候选，面板保持打开支持连发；打字时由 updateCandidates 自动收起
+                    setOnClickListener { currentInputConnection?.commitText(emoji, 1) }
+                })
+            }
+            grid.addView(row)
+        }
+
+        val scroll = ScrollView(this).apply {
+            addView(grid)
+            setBackgroundColor(Color.parseColor("#F5F5F5"))
+        }
+
+        emojiPopup = PopupWindow(
+            scroll,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            (280 * density).toInt(),
+            true
+        ).apply {
+            elevation = 8 * density
+        }
+        // 悬浮在键盘上方（同剪贴板浮层）
+        emojiPopup?.showAtLocation(anchor, Gravity.BOTTOM or Gravity.START, 0, anchor.height)
+    }
+
+    private fun dismissEmojiPanel() {
+        emojiPopup?.dismiss()
+        emojiPopup = null
+    }
+
     private fun handleDelete() {
         feedbackManager.vibrate(vibrationStrength)
         if (currentInput.isNotEmpty()) {
@@ -650,6 +731,10 @@ class PersonalIMEService : InputMethodService() {
                 }
             }
             updateCandidates()
+        } else if (associationCandidates.isNotEmpty()) {
+            // 退格先收起联想候选（主流输入法行为），再按才删正文
+            associationCandidates = emptyList()
+            updateCandidates()
         } else {
             currentInputConnection?.deleteSurroundingText(1, 0)
         }
@@ -658,6 +743,11 @@ class PersonalIMEService : InputMethodService() {
     private fun handleSpace() {
         feedbackManager.vibrate(vibrationStrength)
         if (currentInput.isEmpty()) {
+            // 联想状态下空格上屏首选项（与正常候选流一致）
+            if (associationCandidates.isNotEmpty()) {
+                commitCandidate(associationCandidates[0])
+                return
+            }
             currentInputConnection?.commitText(" ", 1)
             return
         }
@@ -715,6 +805,11 @@ class PersonalIMEService : InputMethodService() {
             }
         }
         currentInputConnection?.commitText(text, 1)
+        // 标点/数字打断上下文，清空联想候选并同步候选栏
+        if (associationCandidates.isNotEmpty()) {
+            associationCandidates = emptyList()
+            updateCandidates()
+        }
     }
 
     // ==================== 候选与上屏 ====================
@@ -724,8 +819,9 @@ class PersonalIMEService : InputMethodService() {
     }
 
     private fun updateCandidates() {
-        // 打字/切页都会刷新候选，此时收起剪贴板浮层避免遮挡新候选
+        // 打字/切页都会刷新候选，此时收起剪贴板/表情浮层避免遮挡新候选
         dismissClipboardPopup()
+        dismissEmojiPanel()
         val candidatesView = candidateLayout ?: return
         candidatesView.removeAllViews()
         // 新一轮候选从头展示，避免停留在上一次的横向滚动位置
@@ -761,9 +857,14 @@ class PersonalIMEService : InputMethodService() {
             return
         }
 
-        // 无输入：左侧显示标点（就像参考设计的标点列）
+        // 无输入：有联想候选则展示（上屏后的下文推荐）；否则左侧显示标点列
         if (currentInput.isEmpty()) {
             populatePunctuationColumn()
+            associationCandidates.forEachIndexed { index, c ->
+                candidatesView.addView(
+                    createCandidateView(c.text, index == 0) { commitCandidate(c) }
+                )
+            }
             return
         }
 
@@ -941,6 +1042,8 @@ class PersonalIMEService : InputMethodService() {
             }
         }
         currentInput = ""
+        // 联想：推荐以上屏词为前缀的更长词（主流输入法下文推荐），无命中则为空
+        associationCandidates = pinyinEngine.associate(candidate.text)
         updateCandidates()
     }
 
@@ -950,6 +1053,7 @@ class PersonalIMEService : InputMethodService() {
             englishEngine.learn(text)
         }
         currentInput = ""
+        associationCandidates = emptyList()
         updateCandidates()
     }
 
@@ -975,6 +1079,7 @@ class PersonalIMEService : InputMethodService() {
         } catch (_: Exception) {
         }
         dismissClipboardPopup()
+        dismissEmojiPanel()
         serviceScope.cancel()
         feedbackManager.release()
         database.close()

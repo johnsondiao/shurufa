@@ -901,6 +901,28 @@ class DictionaryDatabase(private val appContext: Context) :
         return words
     }
 
+    /** 联想查询：以已上屏词为前缀的更长词条（如 中国 -> 中国人），按词频降序。
+     *  word 列 GLOB 前缀匹配走 idx_words_word 索引；排除原词自身 */
+    fun queryWordsByPrefix(prefix: String, limit: Int): List<Triple<String, String, Int>> {
+        val words = mutableListOf<Triple<String, String, Int>>()
+        val db = readableDatabase
+        val cursor = db.query(
+            TABLE_WORDS,
+            arrayOf(COL_WORD, COL_PINYIN, COL_FREQ),
+            "$COL_WORD GLOB ? AND $COL_WORD != ?",
+            arrayOf(prefix + "*", prefix),
+            null, null,
+            "$COL_FREQ DESC",
+            limit.toString()
+        )
+        cursor.use {
+            while (it.moveToNext()) {
+                words.add(Triple(it.getString(0), it.getString(1), it.getInt(2)))
+            }
+        }
+        return words
+    }
+
     /** 按拼音提升词频（用户选词学习）。异步执行 + pinyin 索引，不阻塞主线程。
      *  用户词保护档：词频低于 USER_TIER 时直接跳档（一次上屏即可置顶），已入档则继续 +1 */
     fun incrementFrequency(pinyin: String) {
