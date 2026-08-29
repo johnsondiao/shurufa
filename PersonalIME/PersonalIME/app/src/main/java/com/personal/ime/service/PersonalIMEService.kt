@@ -44,7 +44,6 @@ class PersonalIMEService : InputMethodService() {
     private var isShifted = false
     private var isPrivacyMode = false
     private var vibrationStrength = 30
-    private var soundVolume = 20
     private var keyboardHeightDp = 60f
     private var keySizeSp = 16f
     private var keyboardOffsetPx = 0
@@ -123,13 +122,10 @@ class PersonalIMEService : InputMethodService() {
         serviceScope.launch {
             preferencesManager.vibrationStrength.collect { vibrationStrength = it }
         }
-        serviceScope.launch {
-            preferencesManager.soundVolume.collect { soundVolume = it }
-        }
         // 键盘尺寸设置：变化时重建键盘以应用新尺寸
         serviceScope.launch {
             preferencesManager.keyboardHeight.collect {
-                keyboardHeightDp = 44f + it * 28f / 100f
+                keyboardHeightDp = 52f + it * 32f / 100f
                 if (keyboardContainer != null) rebuildKeyboard()
             }
         }
@@ -431,7 +427,6 @@ class PersonalIMEService : InputMethodService() {
         // 分隔符 ' 不计入长度
         if (currentInput.count { it != '\'' } >= MAX_T9_PENDING) return
         feedbackManager.vibrate(vibrationStrength)
-        feedbackManager.playSound(soundVolume)
         currentInput += digit
         updateCandidates()
     }
@@ -439,7 +434,6 @@ class PersonalIMEService : InputMethodService() {
     /** T9 分词键（1 键）：在数字串中插入音节分隔符，强制切分如 94'26 = xi'an */
     private fun handleT9Separator(digit: Char) {
         feedbackManager.vibrate(vibrationStrength)
-        feedbackManager.playSound(soundVolume)
         // 不能开头、不能连续（仅在已有数字且末尾是数字时插入）
         if (currentInput.isEmpty() || currentInput.last() == '\'') return
         currentInput += '\''
@@ -448,7 +442,6 @@ class PersonalIMEService : InputMethodService() {
 
     private fun handleLetterKey(letter: Char) {
         feedbackManager.vibrate(vibrationStrength)
-        feedbackManager.playSound(soundVolume)
         currentInput += if (isShifted) letter.uppercaseChar() else letter
         if (isShifted) {
             isShifted = false
@@ -460,7 +453,6 @@ class PersonalIMEService : InputMethodService() {
 
     private fun toggleShift() {
         feedbackManager.vibrate(vibrationStrength)
-        feedbackManager.playSound(soundVolume)
         isShifted = !isShifted
         updateShiftState()
     }
@@ -476,7 +468,6 @@ class PersonalIMEService : InputMethodService() {
     /** 清空当前输入（重输） */
     private fun clearInput() {
         feedbackManager.vibrate(vibrationStrength)
-        feedbackManager.playSound(soundVolume)
         currentInput = ""
         updateCandidates()
     }
@@ -484,7 +475,6 @@ class PersonalIMEService : InputMethodService() {
     /** 中/英切换（正式模式切换；临时英文下按此键转为正式英文模式） */
     private fun toggleInputMode() {
         feedbackManager.vibrate(vibrationStrength)
-        feedbackManager.playSound(soundVolume)
         if (currentInput.isNotEmpty()) {
             currentInput = ""
             currentInputConnection?.finishComposingText()
@@ -504,7 +494,6 @@ class PersonalIMEService : InputMethodService() {
     /** 中文输入中临时切到 26 键英文，英文单词上屏后自动返回 9 键 */
     private fun switchToEnglishTemp() {
         feedbackManager.vibrate(vibrationStrength)
-        feedbackManager.playSound(soundVolume)
         if (currentInput.isNotEmpty()) {
             flushT9Pending()
         }
@@ -519,7 +508,6 @@ class PersonalIMEService : InputMethodService() {
     /** 从 26 键手动回到中文 9 键 */
     private fun backToChinese() {
         feedbackManager.vibrate(vibrationStrength)
-        feedbackManager.playSound(soundVolume)
         if (currentInput.isNotEmpty()) {
             currentInput = ""
             currentInputConnection?.finishComposingText()
@@ -651,7 +639,6 @@ class PersonalIMEService : InputMethodService() {
 
     private fun handleDelete() {
         feedbackManager.vibrate(vibrationStrength)
-        feedbackManager.playSound(soundVolume)
         if (currentInput.isNotEmpty()) {
             currentInput = currentInput.dropLast(1)
             // 仅英文模式更新 composing；T9 模式绝不把数字写进输入框
@@ -670,7 +657,6 @@ class PersonalIMEService : InputMethodService() {
 
     private fun handleSpace() {
         feedbackManager.vibrate(vibrationStrength)
-        feedbackManager.playSound(soundVolume)
         if (currentInput.isEmpty()) {
             currentInputConnection?.commitText(" ", 1)
             return
@@ -690,7 +676,6 @@ class PersonalIMEService : InputMethodService() {
 
     private fun handleEnter() {
         feedbackManager.vibrate(vibrationStrength)
-        feedbackManager.playSound(soundVolume)
         if (currentInput.isNotEmpty()) {
             if (inputMode == InputMode.CHINESE_T9) {
                 flushT9Pending()
@@ -722,7 +707,6 @@ class PersonalIMEService : InputMethodService() {
     /** 直接上屏标点/数字等文本 */
     private fun commitPlainText(text: String) {
         feedbackManager.vibrate(vibrationStrength)
-        feedbackManager.playSound(soundVolume)
         if (currentInput.isNotEmpty()) {
             if (inputMode == InputMode.CHINESE_T9) {
                 flushT9Pending()

@@ -1,8 +1,6 @@
 package com.personal.ime.util
 
 import android.content.Context
-import android.media.AudioManager
-import android.media.ToneGenerator
 import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -18,8 +16,6 @@ class FeedbackManager(private val context: Context) {
         context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
     }
 
-    private val toneGenerator: ToneGenerator? = ToneGenerator(AudioManager.STREAM_SYSTEM, 50)
-
     fun vibrate(strength: Int) {
         if (strength <= 0) return
 
@@ -27,13 +23,7 @@ class FeedbackManager(private val context: Context) {
         vibrator?.vibrate(VibrationEffect.createOneShot(duration, VibrationEffect.DEFAULT_AMPLITUDE))
     }
 
-    fun playSound(volume: Int) {
-        if (volume <= 0) return
-
-        toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP, 50)
-    }
-
     fun release() {
-        toneGenerator?.release()
+        // 仅保留振动反馈（按键音已移除），无需释放资源；保留接口避免调用方改动
     }
 }

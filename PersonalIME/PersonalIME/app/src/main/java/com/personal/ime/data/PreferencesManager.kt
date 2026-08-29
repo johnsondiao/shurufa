@@ -16,7 +16,6 @@ class PreferencesManager(private val context: Context) {
         val KEY_SIZE = intPreferencesKey("key_size")
         val KEYBOARD_OFFSET = intPreferencesKey("keyboard_offset")
         val VIBRATION_STRENGTH = intPreferencesKey("vibration_strength")
-        val SOUND_VOLUME = intPreferencesKey("sound_volume")
         val THEME = stringPreferencesKey("theme")
         val PRIVACY_MODE = booleanPreferencesKey("privacy_mode")
         val CUSTOM_BG_PATH = stringPreferencesKey("custom_bg_path")
@@ -26,7 +25,6 @@ class PreferencesManager(private val context: Context) {
     val keySize: Flow<Int> = context.dataStore.data.map { it[KEY_SIZE] ?: 50 }
     val keyboardOffset: Flow<Int> = context.dataStore.data.map { it[KEYBOARD_OFFSET] ?: 50 }
     val vibrationStrength: Flow<Int> = context.dataStore.data.map { it[VIBRATION_STRENGTH] ?: 30 }
-    val soundVolume: Flow<Int> = context.dataStore.data.map { it[SOUND_VOLUME] ?: 20 }
     val theme: Flow<String> = context.dataStore.data.map { it[THEME] ?: "light" }
     val privacyMode: Flow<Boolean> = context.dataStore.data.map { it[PRIVACY_MODE] ?: false }
     val customBgPath: Flow<String?> = context.dataStore.data.map { it[CUSTOM_BG_PATH] }
@@ -45,10 +43,6 @@ class PreferencesManager(private val context: Context) {
 
     suspend fun setVibrationStrength(value: Int) {
         context.dataStore.edit { it[VIBRATION_STRENGTH] = value }
-    }
-
-    suspend fun setSoundVolume(value: Int) {
-        context.dataStore.edit { it[SOUND_VOLUME] = value }
     }
 
     suspend fun setTheme(value: String) {

@@ -106,19 +106,6 @@ class SettingsActivity : AppCompatActivity() {
             }
         )
 
-        binding.seekbarSound.setOnSeekBarChangeListener(
-            object : android.widget.SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(seekBar: android.widget.SeekBar?, progress: Int, fromUser: Boolean) {
-                    if (fromUser) {
-                        lifecycleScope.launch {
-                            preferencesManager.setSoundVolume(progress)
-                        }
-                    }
-                }
-                override fun onStartTrackingTouch(seekBar: android.widget.SeekBar?) {}
-                override fun onStopTrackingTouch(seekBar: android.widget.SeekBar?) {}
-            }
-        )
     }
 
     private fun setupThemeSpinner() {
@@ -159,7 +146,6 @@ class SettingsActivity : AppCompatActivity() {
             binding.seekbarKeySize.progress = preferencesManager.keySize.first()
             binding.seekbarOffset.progress = preferencesManager.keyboardOffset.first()
             binding.seekbarVibration.progress = preferencesManager.vibrationStrength.first()
-            binding.seekbarSound.progress = preferencesManager.soundVolume.first()
             binding.switchPrivacy.isChecked = preferencesManager.privacyMode.first()
 
             val theme = preferencesManager.theme.first()
