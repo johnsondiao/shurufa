@@ -1,6 +1,7 @@
 package com.personal.ime.service
 
 import android.content.ClipboardManager as SystemClipboardManager
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
 import android.inputmethodservice.InputMethodService
@@ -19,6 +20,7 @@ import com.personal.ime.data.DictionaryDatabase
 import com.personal.ime.data.PreferencesManager
 import com.personal.ime.engine.EnglishEngine
 import com.personal.ime.engine.PinyinEngine
+import com.personal.ime.ui.SettingsActivity
 import com.personal.ime.util.EmojiData
 import com.personal.ime.util.FeedbackManager
 import kotlinx.coroutines.*
@@ -57,10 +59,10 @@ class PersonalIMEService : InputMethodService() {
     private var tempEnglish = false
 
     private var keyboardContainer: LinearLayout? = null
+    private var keyboardToolbar: LinearLayout? = null
     private var keyboardArea: LinearLayout? = null
     private var pinyinSelector: LinearLayout? = null
     private var pinyinSelectorScroll: ScrollView? = null
-    private var pinyinDisplay: TextView? = null
     private var candidateLayout: LinearLayout? = null
     private var candidateScrollView: HorizontalScrollView? = null
     private var shiftKey: Button? = null
@@ -153,14 +155,55 @@ class PersonalIMEService : InputMethodService() {
     override fun onCreateInputView(): View {
         val keyboardView = layoutInflater.inflate(com.personal.ime.R.layout.keyboard_view, null)
         keyboardContainer = keyboardView.findViewById(com.personal.ime.R.id.keyboardContainer)
+        keyboardToolbar = keyboardView.findViewById(com.personal.ime.R.id.keyboardToolbar)
         keyboardArea = keyboardView.findViewById(com.personal.ime.R.id.keyboardArea)
         pinyinSelector = keyboardView.findViewById(com.personal.ime.R.id.pinyinSelector)
         pinyinSelectorScroll = keyboardView.findViewById(com.personal.ime.R.id.pinyinSelectorScroll)
-        pinyinDisplay = keyboardView.findViewById(com.personal.ime.R.id.pinyinDisplay)
         candidateLayout = keyboardView.findViewById(com.personal.ime.R.id.candidateLayout)
         candidateScrollView = keyboardView.findViewById(com.personal.ime.R.id.candidateScrollView)
+        buildToolbar()
         rebuildKeyboard()
         return keyboardView
+    }
+
+    /** 顶部工具栏：右侧功能图标（剪贴板/表情/隐私/设置），仿微信输入法顶部图标行 */
+    private fun buildToolbar() {
+        val toolbar = keyboardToolbar ?: return
+        toolbar.removeAllViews()
+        toolbar.addView(createToolbarIcon("📋") { showClipboard() })
+        toolbar.addView(createToolbarIcon("😊") { toggleEmojiPanel() })
+        toolbar.addView(createToolbarIcon(if (isPrivacyMode) "🔒" else "🔓") { togglePrivacy() })
+        toolbar.addView(createToolbarIcon("⚙") { openSettings() })
+    }
+
+    private fun createToolbarIcon(icon: String, onClick: () -> Unit): TextView {
+        return TextView(this).apply {
+            text = icon
+            textSize = 18f
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(
+                (44 * resources.displayMetrics.density).toInt(),
+                LinearLayout.LayoutParams.MATCH_PARENT
+            )
+            setOnClickListener { onClick() }
+        }
+    }
+
+    /** 切换隐私模式（工具栏锁形图标）：开启后不学习词频与输入习惯 */
+    private fun togglePrivacy() {
+        feedbackManager.vibrate(vibrationStrength)
+        isPrivacyMode = !isPrivacyMode
+        serviceScope.launch { preferencesManager.setPrivacyMode(isPrivacyMode) }
+        buildToolbar()
+    }
+
+    /** 打开设置页（从输入法服务启动需新任务栈） */
+    private fun openSettings() {
+        feedbackManager.vibrate(vibrationStrength)
+        startActivity(
+            Intent(this, SettingsActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
     }
 
     /** 将 0-100 的设置值映射为实际尺寸（dp/sp） */
@@ -203,16 +246,14 @@ class PersonalIMEService : InputMethodService() {
     }
 
     /**
-     * T9 键盘布局（参考主流输入法）：
-     * 左列：, / 。 ?    中3列：1' ABC DEF / GHI JKL MNO / PQRS TUV WXYZ    右列：⌫ 重输 换行
-     * 底行：符号  123  空格  中/英
+     * T9 键盘布局（仿微信输入法九键）：
+     * 左列：, . / ? '    中3列：@# ABC DEF / GHI JKL MNO / PQRS TUV WXYZ    右列：⌫ 重输 换行
+     * 底行：符号  123  空格  中/英（剪贴板/表情已移到顶部工具栏）
      */
     private fun buildT9Keyboard(container: LinearLayout) {
-        // 左侧标点列已移到独立的 pinyinSelector（无拼音时显示标点，避免键盘左右跳动），
-        // 故各行不再内嵌标点窄键，T9 键更宽。右侧仍为功能键。
-        // Row 1: 1'  ABC  DEF | ⌫
+        // Row 1: @#  ABC  DEF | ⌫
         val row1 = createKeyboardRow()
-        row1.addView(createT9Key("1'", '1', ::handleT9Separator))
+        row1.addView(createAtHashKey())
         row1.addView(createT9Key("ABC", '2', ::handleT9Key))
         row1.addView(createT9Key("DEF", '3', ::handleT9Key))
         row1.addView(createSpecialKey("⌫", ::handleDelete))
@@ -234,15 +275,12 @@ class PersonalIMEService : InputMethodService() {
         row3.addView(createSpecialKey("换行", ::handleEnter))
         container.addView(row3)
 
-        // Row 4: 符号  123  剪  表情  空格  英  中/英（填满整行）
+        // Row 4: 符号  123  空格  中/英（仿微信输入法底行）
         val row4 = createKeyboardRow()
         row4.addView(createSpecialKey("符号", ::showSymbols))
         row4.addView(createSpecialKey("123", ::showNumbers))
-        row4.addView(createSpecialKey("剪", ::showClipboard, weight = 0.8f))
-        row4.addView(createSpecialKey("表情", ::toggleEmojiPanel, weight = 0.9f))
-        row4.addView(createSpecialKey("空格", { handleSpace() }, weight = 1.4f))
-        row4.addView(createSpecialKey("英", ::switchToEnglishTemp, weight = 0.8f))
-        row4.addView(createSpecialKey(modeLabel(), ::toggleInputMode))
+        row4.addView(createSpecialKey("空格", { handleSpace() }, weight = 2.5f))
+        row4.addView(createModeKey())
         container.addView(row4)
     }
 
@@ -386,6 +424,32 @@ class PersonalIMEService : InputMethodService() {
                 commitPlainText(digit.toString())
                 true
             }
+        }
+    }
+
+    /** 左上角 @# 键（仿微信输入法）：点按上屏 @，长按上屏 # */
+    private fun createAtHashKey(): Button {
+        return Button(this).apply {
+            text = "@#"
+            textSize = keySizeSp
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
+                setMargins(keyMarginPx, keyMarginPx, keyMarginPx, keyMarginPx)
+            }
+            setOnClickListener { commitPlainText("@") }
+            setOnLongClickListener { commitPlainText("#"); true }
+        }
+    }
+
+    /** 中/英切换键：点按正式切换，长按临时英文（英文上屏后自动回 9 键） */
+    private fun createModeKey(): Button {
+        return Button(this).apply {
+            text = modeLabel()
+            textSize = keySizeSp - 2f
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
+                setMargins(keyMarginPx, keyMarginPx, keyMarginPx, keyMarginPx)
+            }
+            setOnClickListener { toggleInputMode() }
+            setOnLongClickListener { switchToEnglishTemp(); true }
         }
     }
 
@@ -832,7 +896,6 @@ class PersonalIMEService : InputMethodService() {
 
         // 先记住上一次选择的拼音，清空后再用它恢复选中项（避免点击被重置回第一项）
         val previousSelection = selectedPinyin
-        pinyinDisplay?.visibility = View.GONE
         pinyinSelectorScroll?.scrollTo(0, 0)
         pinyinSelector?.removeAllViews()
         selectedPinyin = null
@@ -872,25 +935,25 @@ class PersonalIMEService : InputMethodService() {
         }
 
         val allSplits = pinyinEngine.pinyinSplits(currentInput, limit = 10)
+        val echoReading: String?
         if (allSplits.size > 1) {
             // 多种读法：左侧显示拼音选择列；保留用户已选项（若仍在列表中）
             val selected = previousSelection?.takeIf { it in allSplits } ?: allSplits.first()
             selectedPinyin = selected
-            pinyinDisplay?.text = selected
-            pinyinDisplay?.visibility = View.VISIBLE
+            echoReading = selected
             allSplits.forEach { py ->
                 pinyinSelector?.addView(createPinyinSelectorView(py, py == selected) {
                     selectPinyin(py)
                 })
             }
         } else {
-            // 唯一读法或无法切分：左侧回落到标点列，拼音回显仍展示在顶行
+            // 唯一读法或无法切分：左侧回落到标点列
             populatePunctuationColumn()
-            allSplits.firstOrNull()?.let {
-                pinyinDisplay?.text = it
-                pinyinDisplay?.visibility = View.VISIBLE
-            }
+            echoReading = allSplits.firstOrNull()
         }
+
+        // 拼音回显作为候选栏首项（仿微信输入法：回显与候选同行）
+        echoReading?.let { candidatesView.addView(createPinyinView(it)) }
 
         val candidates = displayCandidates()
         candidates.forEachIndexed { index, candidate ->
@@ -900,16 +963,17 @@ class PersonalIMEService : InputMethodService() {
         }
     }
 
-    /** 左侧列无拼音选择时的默认内容：常用标点 + 隐私开关（宽度恒定，避免键盘左右跳动） */
+    /** 左侧列无拼音选择时的默认内容：半角标点 + 分词键（仿微信输入法左列，宽度恒定避免键盘左右跳动） */
     private fun populatePunctuationColumn() {
-        arrayOf("，", "/", "。", "？").forEach { p ->
+        arrayOf(",", ".", "/", "?").forEach { p ->
             pinyinSelector?.addView(createPunctuationKey(p))
         }
-        pinyinSelector?.addView(createPrivacyKey())
+        // 分词键：从原 1' 键位移入左列，插入音节分隔符（如 94'26 = xi'an）
+        pinyinSelector?.addView(createPunctuationKey("'") { handleT9Separator('1') })
     }
 
-    /** 左侧标点列单项（高度对齐键盘行，点击直接上屏标点） */
-    private fun createPunctuationKey(text: String): TextView {
+    /** 左侧标点列单项（高度对齐键盘行，点击直接上屏标点；可自定义点击行为） */
+    private fun createPunctuationKey(text: String, onClick: (() -> Unit)? = null): TextView {
         return TextView(this).apply {
             this.text = text
             textSize = 18f
@@ -919,34 +983,7 @@ class PersonalIMEService : InputMethodService() {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 (60 * resources.displayMetrics.density).toInt()
             )
-            setOnClickListener { commitPlainText(text) }
-        }
-    }
-
-    /** 隐私模式开关（左侧列底部）：开启时高亮显示，点击切换 */
-    private fun createPrivacyKey(): TextView {
-        return TextView(this).apply {
-            text = if (isPrivacyMode) "隐✓" else "隐"
-            textSize = 14f
-            gravity = Gravity.CENTER
-            setTextColor(if (isPrivacyMode) Color.WHITE else Color.BLACK)
-            setBackgroundResource(
-                if (isPrivacyMode) com.personal.ime.R.drawable.candidate_highlight
-                else com.personal.ime.R.drawable.key_bg_selector
-            )
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                (60 * resources.displayMetrics.density).toInt()
-            )
-            setOnClickListener {
-                feedbackManager.vibrate(vibrationStrength)
-                val newState = !isPrivacyMode
-                isPrivacyMode = newState
-                serviceScope.launch { preferencesManager.setPrivacyMode(newState) }
-                // 刷新左侧列以更新按钮外观（高亮/普通）
-                pinyinSelector?.removeAllViews()
-                populatePunctuationColumn()
-            }
+            setOnClickListener { if (onClick != null) onClick() else commitPlainText(text) }
         }
     }
 

@@ -5,23 +5,18 @@
     android:orientation="vertical"
     android:background="@color/keyboard_bg_light">
 
-    <!-- 拼音回显行（单独一行；长句回显单行省略避免换行被裁） -->
-    <TextView
-        android:id="@+id/pinyinDisplay"
+    <!-- 顶部工具栏（仿微信输入法）：右侧功能图标（剪贴板/表情/隐私/设置） -->
+    <LinearLayout
+        android:id="@+id/keyboardToolbar"
         android:layout_width="match_parent"
         android:layout_height="36dp"
         android:background="@color/candidate_bg_light"
-        android:gravity="center_vertical"
-        android:paddingStart="16dp"
-        android:paddingEnd="16dp"
-        android:maxLines="1"
-        android:ellipsize="end"
-        android:textSize="16sp"
-        android:textStyle="bold"
-        android:textColor="#1E8E3E"
-        android:visibility="gone" />
+        android:gravity="end|center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="8dp"
+        android:paddingEnd="4dp" />
 
-    <!-- 候选字行（单独一行，横向滚动） -->
+    <!-- 候选字行（单独一行，横向滚动；拼音回显作为首项内嵌在候选栏） -->
     <HorizontalScrollView
         android:id="@+id/candidateScrollView"
         android:layout_width="match_parent"
