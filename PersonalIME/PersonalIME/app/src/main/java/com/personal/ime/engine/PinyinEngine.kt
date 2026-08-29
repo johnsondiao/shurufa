@@ -410,6 +410,11 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         database.insertWord(pinyin, word)
     }
 
+    /** 学习用户组合新词（整句上屏时自动调用），下次直接作为词条命中 */
+    fun learnPhrase(pinyin: String, word: String) {
+        database.learnPhrase(pinyin, word)
+    }
+
     companion object {
         // 覆盖率实测：20 条时 23.8% 词条不可达，60 条时仅 4.5%（超大同音组尾部）
         private const val CANDIDATE_LIMIT = 60

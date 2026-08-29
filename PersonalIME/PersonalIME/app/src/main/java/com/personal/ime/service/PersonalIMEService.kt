@@ -928,8 +928,13 @@ class PersonalIMEService : InputMethodService() {
         currentInputConnection?.commitText(candidate.text, 1)
         if (!isPrivacyMode) {
             if (candidate.components.isNotEmpty()) {
-                // 整句候选：components 存各组成词的拼音，逐词学习
+                // 整句候选：components 存各组成词的拼音，逐词学习；
+                // 同时把整句作为新词入库（用户组词能力），下次直接命中置顶。
+                // 限长 2~8 字：单字无组词意义，超长串避免误学垃圾组合。
                 candidate.components.forEach { pinyinEngine.incrementFrequency(it) }
+                if (candidate.text.length in 2..8) {
+                    pinyinEngine.learnPhrase(candidate.pinyin, candidate.text)
+                }
             } else if (candidate.pinyin.isNotEmpty()) {
                 // 普通候选：按拼音学习（精确匹配该读音的词条）
                 pinyinEngine.incrementFrequency(candidate.pinyin)

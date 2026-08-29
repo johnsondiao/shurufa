@@ -894,6 +894,28 @@ class DictionaryDatabase(private val appContext: Context) :
     }
 
     /**
+     * 学习用户组合新词（整句候选上屏时调用）：
+     * 词库没有则新建（直接入用户保护档），已有则升档/+1。
+     * 用 CONFLICT_IGNORE + UPDATE，避免 REPLACE 把已有词条词频清零重建。
+     */
+    fun learnPhrase(pinyin: String, word: String) {
+        ioScope.launch {
+            val db = writableDatabase
+            val values = ContentValues().apply {
+                put(COL_PINYIN, pinyin.lowercase())
+                put(COL_WORD, word)
+                put(COL_FREQ, USER_TIER)
+                put(COL_DIGITS, toDigits(pinyin))
+            }
+            db.insertWithOnConflict(TABLE_WORDS, null, values, SQLiteDatabase.CONFLICT_IGNORE)
+            db.execSQL(
+                "UPDATE $TABLE_WORDS SET $COL_FREQ = CASE WHEN $COL_FREQ < $USER_TIER THEN $USER_TIER ELSE $COL_FREQ + 1 END WHERE $COL_PINYIN = ? AND $COL_WORD = ?",
+                arrayOf(pinyin.lowercase(), word)
+            )
+        }
+    }
+
+    /**
      * 学习英文单词：已存在则词频 +1，否则新建记录。
      * 仅接受纯英文字母的单词，避免中文拼音词条被误写。
      */
