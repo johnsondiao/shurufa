@@ -1,5 +1,6 @@
 package com.personal.ime.service
 
+import android.content.ClipboardManager as SystemClipboardManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.inputmethodservice.InputMethodService
@@ -10,6 +11,7 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.PopupWindow
 import android.widget.ScrollView
 import android.widget.TextView
 import com.personal.ime.data.ClipboardManager
@@ -64,6 +66,16 @@ class PersonalIMEService : InputMethodService() {
     private var shiftKey: Button? = null
     private val qwertyLetterKeys = mutableListOf<Button>()
 
+    /** 剪贴板历史浮层（点底行"剪"键弹出，点历史项直接上屏） */
+    private var clipboardPopup: PopupWindow? = null
+    private var systemClipboard: SystemClipboardManager? = null
+
+    /** 系统剪贴板变化监听器（持有引用以便 onDestroy 移除） */
+    private val clipChangedListener = SystemClipboardManager.OnPrimaryClipChangedListener {
+        val text = readSystemClipboardText()
+        if (!text.isNullOrBlank()) clipboardManager.addItem(text)
+    }
+
     /** T9 模式下当前选中的拼音（用于过滤候选字） */
     private var selectedPinyin: String? = null
 
@@ -97,6 +109,13 @@ class PersonalIMEService : InputMethodService() {
         serviceScope.launch(Dispatchers.IO) {
             database.warmUp()
         }
+
+        // 监听系统剪贴板：用户在其他应用复制的内容自动记入剪贴板历史。
+        // 注意 IME 自身上屏不写系统剪贴板，因此不会把自己打出的字误记进去。
+        // Android 10+ 后台读剪贴板受限，此时读到 null/空，忽略即可。
+        systemClipboard = getSystemService(CLIPBOARD_SERVICE) as? SystemClipboardManager
+        readSystemClipboardText()?.takeIf { it.isNotBlank() }?.let { clipboardManager.addItem(it) }
+        systemClipboard?.addPrimaryClipChangedListener(clipChangedListener)
 
         serviceScope.launch {
             preferencesManager.privacyMode.collect { isPrivacyMode = it }
@@ -148,6 +167,7 @@ class PersonalIMEService : InputMethodService() {
     // ==================== 键盘构建 ====================
 
     private fun rebuildKeyboard() {
+        dismissClipboardPopup()
         val container = keyboardArea ?: return
         container.removeAllViews()
         qwertyLetterKeys.clear()
@@ -210,11 +230,12 @@ class PersonalIMEService : InputMethodService() {
         row3.addView(createSpecialKey("换行", ::handleEnter))
         container.addView(row3)
 
-        // Row 4: 符号  123  空格  英  中/英（填满整行）
+        // Row 4: 符号  123  剪  空格  英  中/英（填满整行）
         val row4 = createKeyboardRow()
         row4.addView(createSpecialKey("符号", ::showSymbols))
         row4.addView(createSpecialKey("123", ::showNumbers))
-        row4.addView(createSpecialKey("空格", { handleSpace() }, weight = 2f))
+        row4.addView(createSpecialKey("剪", ::showClipboard, weight = 0.8f))
+        row4.addView(createSpecialKey("空格", { handleSpace() }, weight = 1.8f))
         row4.addView(createSpecialKey("英", ::switchToEnglishTemp, weight = 0.8f))
         row4.addView(createSpecialKey(modeLabel(), ::toggleInputMode))
         container.addView(row4)
@@ -542,6 +563,92 @@ class PersonalIMEService : InputMethodService() {
         rebuildKeyboard()
     }
 
+    // ==================== 剪贴板 ====================
+
+    /** 切换剪贴板历史浮层：已打开则关闭，未打开则展示 */
+    private fun showClipboard() {
+        feedbackManager.vibrate(vibrationStrength)
+        if (clipboardPopup?.isShowing == true) {
+            dismissClipboardPopup()
+            return
+        }
+        showClipboardPopup()
+    }
+
+    /** 弹出剪贴板历史浮层：纵向列表，点击条目直接上屏 */
+    private fun showClipboardPopup() {
+        val anchor = keyboardContainer ?: return
+        val items = clipboardManager.getAllItems()
+        val density = resources.displayMetrics.density
+
+        val listLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding((8 * density).toInt(), (8 * density).toInt(), (8 * density).toInt(), (8 * density).toInt())
+        }
+
+        val title = TextView(this).apply {
+            text = if (items.isEmpty()) "剪贴板（暂无记录）" else "剪贴板"
+            textSize = 13f
+            setTypeface(Typeface.DEFAULT_BOLD)
+            setPadding((8 * density).toInt(), 0, 0, (8 * density).toInt())
+        }
+        listLayout.addView(title)
+
+        items.forEach { item ->
+            val preview = item.replace('\n', ' ')
+            val tv = TextView(this).apply {
+                text = if (preview.length > 40) preview.substring(0, 40) + "…" else preview
+                textSize = 15f
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                setPadding((12 * density).toInt(), (10 * density).toInt(), (12 * density).toInt(), (10 * density).toInt())
+                setBackgroundResource(com.personal.ime.R.drawable.key_bg_selector)
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = (2 * density).toInt() }
+                setOnClickListener {
+                    currentInputConnection?.commitText(item, 1)
+                    dismissClipboardPopup()
+                }
+            }
+            listLayout.addView(tv)
+        }
+
+        val scroll = ScrollView(this).apply {
+            addView(listLayout)
+            setBackgroundColor(Color.parseColor("#F5F5F5"))
+        }
+
+        val popupHeight = (280 * density).toInt()
+        clipboardPopup = PopupWindow(
+            scroll,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            popupHeight,
+            true
+        ).apply {
+            elevation = 8 * density
+        }
+        // 悬浮在键盘区域上方，从锚点（键盘容器）顶部向上偏移自身高度，盖住候选栏与输入区
+        clipboardPopup?.showAtLocation(anchor, Gravity.BOTTOM or Gravity.START, 0, anchor.height)
+    }
+
+    private fun dismissClipboardPopup() {
+        clipboardPopup?.dismiss()
+        clipboardPopup = null
+    }
+
+    /** 安全读取系统剪贴板首条文本：空剪贴板/权限受限时返回 null 而不崩溃 */
+    private fun readSystemClipboardText(): String? {
+        val clip = systemClipboard?.primaryClip ?: return null
+        return try {
+            if (clip.itemCount == 0) null
+            else clip.getItemAt(0)?.coerceToText(this)?.toString()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private fun handleDelete() {
         feedbackManager.vibrate(vibrationStrength)
         feedbackManager.playSound(soundVolume)
@@ -633,6 +740,8 @@ class PersonalIMEService : InputMethodService() {
     }
 
     private fun updateCandidates() {
+        // 打字/切页都会刷新候选，此时收起剪贴板浮层避免遮挡新候选
+        dismissClipboardPopup()
         val candidatesView = candidateLayout ?: return
         candidatesView.removeAllViews()
         // 新一轮候选从头展示，避免停留在上一次的横向滚动位置
@@ -844,6 +953,11 @@ class PersonalIMEService : InputMethodService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        try {
+            systemClipboard?.removePrimaryClipChangedListener(clipChangedListener)
+        } catch (_: Exception) {
+        }
+        dismissClipboardPopup()
         serviceScope.cancel()
         feedbackManager.release()
         database.close()
