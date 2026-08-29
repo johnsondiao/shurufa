@@ -13,8 +13,9 @@ import com.personal.ime.data.DictionaryDatabase
  */
 class PinyinEngine(private val database: DictionaryDatabase) {
 
-    /** components 仅整句候选使用：存各组成词的拼音（如 "che"、"tui"），上屏时逐词学习词频 */
-    data class Candidate(val text: String, val frequency: Int, val pinyin: String = "", val components: List<String> = emptyList())
+    /** components 仅整句候选使用：存各组成词的拼音（如 "che"、"tui"），上屏时逐词学习词频；
+     *  matchTier 记录匹配层级（0=恰好打完），供展示层把打完的词置顶 */
+    data class Candidate(val text: String, val frequency: Int, val pinyin: String = "", val components: List<String> = emptyList(), val matchTier: Int = 2)
 
     // T9 数字 -> 字母（用于候选栏拼音回显的分段计算）
     private val digitLetters = mapOf(
@@ -108,7 +109,7 @@ class PinyinEngine(private val database: DictionaryDatabase) {
             }
 
         return merged.entries
-            .map { Candidate(it.key, it.value.first, it.value.second) }
+            .map { Candidate(it.key, it.value.first, it.value.second, emptyList(), it.value.third) }
             .sortedWith(
                 // 匹配层级升序（打完的词置顶）；层内词频降序；同频短词优先。
                 // LinkedHashMap 插入序保证同层同频内“恰好打完”的词条稳定靠前。
@@ -233,7 +234,7 @@ class PinyinEngine(private val database: DictionaryDatabase) {
             }
 
         return merged.entries
-            .map { Candidate(it.key, it.value.first, it.value.second) }
+            .map { Candidate(it.key, it.value.first, it.value.second, emptyList(), it.value.third) }
             .sortedWith(
                 compareBy<Candidate> { c -> merged[c.text]?.third ?: 2 }
                     .thenByDescending { it.frequency }

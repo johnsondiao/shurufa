@@ -504,6 +504,7 @@ class PersonalIMEService : InputMethodService() {
         }
         keyboardPage = KeyboardPage.T9
         isShifted = false
+        associationCandidates = emptyList()
         rebuildKeyboard()
         updateCandidates()
     }
@@ -518,6 +519,7 @@ class PersonalIMEService : InputMethodService() {
         tempEnglish = true
         keyboardPage = KeyboardPage.T9
         isShifted = false
+        associationCandidates = emptyList()
         rebuildKeyboard()
         updateCandidates()
     }
@@ -533,6 +535,7 @@ class PersonalIMEService : InputMethodService() {
         tempEnglish = false
         keyboardPage = KeyboardPage.T9
         isShifted = false
+        associationCandidates = emptyList()
         rebuildKeyboard()
         updateCandidates()
     }
@@ -953,12 +956,16 @@ class PersonalIMEService : InputMethodService() {
         return pinyinEngine.inputT9ByPinyin(currentInput, selected)
     }
 
-    /** 展示/上屏用候选：整句组合候选在前，其次按选中拼音过滤的单词候选（两者去重） */
+    /** 展示/上屏用候选：打完的词（tier0）置顶 → 整句组合 → 其余候选（去重） */
     private fun displayCandidates(): List<PinyinEngine.Candidate> {
-        val sentences = pinyinEngine.sentenceCandidates(currentInput, 3)
         val singles = filteredCandidates()
+        // 恰好打完的词（tier0）必须置顶，其次整句组合，再其余：
+        // 整句若排最前，低频组合（如 黑我）会抢占空格位导致上屏错词（模拟测试发现）
+        val exact = singles.filter { it.matchTier == 0 }
+        val sentences = pinyinEngine.sentenceCandidates(currentInput, 3)
+        val rest = singles.filter { it.matchTier != 0 }
         // 候选栏可横向滚动；全量覆盖率模拟表明 60 条可覆盖 95.5% 词条（含被高频词排后的字）
-        return (sentences + singles).distinctBy { it.text }.take(60)
+        return (exact + sentences + rest).distinctBy { it.text }.take(60)
     }
 
     /** 选中某个拼音，刷新候选字（高亮由 updateCandidates 重建选择列时统一处理） */

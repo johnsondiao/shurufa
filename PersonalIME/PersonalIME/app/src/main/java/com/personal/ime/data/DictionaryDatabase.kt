@@ -118,12 +118,13 @@ class DictionaryDatabase(private val appContext: Context) :
      * 独立于 commonWords，便于升级路径对存量词库补录（db.insert 遇 UNIQUE 冲突返回 -1，静默跳过）
      */
     private fun insertPhraseSeeds(db: SQLiteDatabase) {
+        // 拼音用音节分隔符格式（与资产词条一致），保证与 learnPhrase 入库格式同构、读法成词加成可命中
         val phrases = mapOf(
-            "geiwo" to "给我",
-            "geini" to "给你",
-            "geita" to "给他",
-            "geitamen" to "给他们",
-            "geiwomen" to "给我们"
+            "gei'wo" to "给我",
+            "gei'ni" to "给你",
+            "gei'ta" to "给他",
+            "gei'ta'men" to "给他们",
+            "gei'wo'men" to "给我们"
         )
         phrases.forEach { (pinyin, word) ->
             val values = ContentValues().apply {
