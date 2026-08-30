@@ -10,7 +10,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 class DictionaryDatabase(private val appContext: Context) :
-    SQLiteOpenHelper(appContext, "dictionary.db", null, 11) {
+    SQLiteOpenHelper(appContext, "dictionary.db", null, 12) {
 
     /** 词频学习等写操作放到 IO 线程，避免主线程卡顿（用户上屏每个词都会触发） */
     private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -64,6 +64,10 @@ class DictionaryDatabase(private val appContext: Context) :
          *  生僻词会排在常用词前面（如 儆鉴 先于 精简）；此表把精选常用词升到 COMMON_TIER */
         private const val ASSET_COMMON_BOOST = "common_boost.txt"
 
+        /** 常用单字升档表（字 词频）：单字五档制（55~85）区分度不足，超高频字（要/秒/及）
+         *  在同音组被一堆同档字排后；按使用频率赋 91~94 修正 */
+        private const val ASSET_CHAR_BOOST = "char_boost.txt"
+
         /** 用户词保护档：用户打过的词直接跳入此档，压过所有基础档位（手编词 90/单字 85/词组 50），
          *  之后再打则在档内 +1，几次即可稳定置顶 */
         private const val USER_TIER = 95
@@ -104,6 +108,12 @@ class DictionaryDatabase(private val appContext: Context) :
 
         // 常用词升档：纠正词组平档导致的同音组乱序（如 精简 排到 儆鉴 前）
         boostCommonWords(db)
+
+        // 常用单字升档：纠正五档制档位失真（如 要 在自己组排第 14）
+        boostCommonChars(db)
+
+        // 重复词条归一：手编连写拼音与资产分隔拼音同词并存 -> 合并为分隔拼音单条
+        normalizeWordDuplicates(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -120,6 +130,11 @@ class DictionaryDatabase(private val appContext: Context) :
             // 10→11：常用词升档（同音组乱序修复，存量用户无需重装）
             if (oldVersion < 11) {
                 boostCommonWords(db)
+            }
+            // 11→12：常用单字升档 + 重复词条归一（先升档后归一，归一保留最高词频）
+            if (oldVersion < 12) {
+                boostCommonChars(db)
+                normalizeWordDuplicates(db)
             }
         } else {
             db.execSQL("DROP TABLE IF EXISTS $TABLE_WORDS")
@@ -986,6 +1001,69 @@ class DictionaryDatabase(private val appContext: Context) :
         } finally {
             db.endTransaction()
             update.close()
+        }
+    }
+
+    /**
+     * 常用单字升档：按资产表（字 词频）提升单字词频，覆盖该字所有读音行。
+     * 仅升不降，保护手编档与用户学习成果。
+     */
+    private fun boostCommonChars(db: SQLiteDatabase) {
+        val lines = try {
+            appContext.assets.open(ASSET_CHAR_BOOST).bufferedReader().use { it.readLines() }
+        } catch (e: Exception) {
+            return
+        }
+        val update = db.compileStatement(
+            "UPDATE $TABLE_WORDS SET $COL_FREQ = ? WHERE $COL_WORD = ? AND length($COL_WORD) = 1 AND $COL_FREQ < ?"
+        )
+        db.beginTransaction()
+        try {
+            for (line in lines) {
+                val parts = line.split(' ')
+                if (parts.size != 2) continue
+                val freq = parts[1].toIntOrNull() ?: continue
+                update.bindLong(1, freq.toLong())
+                update.bindString(2, parts[0])
+                update.bindLong(3, freq.toLong())
+                update.executeUpdateDelete()
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+            update.close()
+        }
+    }
+
+    /**
+     * 重复词条归一：手编种子用连写拼音（zhongguo），资产词组用分隔拼音（zhong'guo），
+     * 同一词双条并存浪费名额且学习只命中一条。合并为分隔拼音单条：
+     * 分隔行词频取同词同数字各条最大值（保留手编 90 档），再删除连写重复行。
+     * 仅处理 length>=2 的多字词，单字多读音行不受影响。
+     */
+    private fun normalizeWordDuplicates(db: SQLiteDatabase) {
+        db.beginTransaction()
+        try {
+            db.execSQL(
+                "UPDATE $TABLE_WORDS SET $COL_FREQ = (" +
+                    "SELECT MAX(w2.$COL_FREQ) FROM $TABLE_WORDS w2 " +
+                    "WHERE w2.$COL_WORD = $TABLE_WORDS.$COL_WORD AND w2.$COL_DIGITS = $TABLE_WORDS.$COL_DIGITS" +
+                    ") WHERE $COL_PINYIN GLOB '*''*' AND length($COL_WORD) >= 2 AND EXISTS (" +
+                    "SELECT 1 FROM $TABLE_WORDS w3 " +
+                    "WHERE w3.$COL_WORD = $TABLE_WORDS.$COL_WORD AND w3.$COL_DIGITS = $TABLE_WORDS.$COL_DIGITS " +
+                    "AND w3.$COL_PINYIN NOT GLOB '*''*'" +
+                    ")"
+            )
+            db.execSQL(
+                "DELETE FROM $TABLE_WORDS WHERE $COL_PINYIN NOT GLOB '*''*' AND length($COL_WORD) >= 2 AND EXISTS (" +
+                    "SELECT 1 FROM $TABLE_WORDS w4 " +
+                    "WHERE w4.$COL_WORD = $TABLE_WORDS.$COL_WORD AND w4.$COL_DIGITS = $TABLE_WORDS.$COL_DIGITS " +
+                    "AND w4.$COL_PINYIN GLOB '*''*'" +
+                    ")"
+            )
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
         }
     }
 
