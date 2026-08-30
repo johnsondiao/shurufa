@@ -10,7 +10,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 class DictionaryDatabase(private val appContext: Context) :
-    SQLiteOpenHelper(appContext, "dictionary.db", null, 10) {
+    SQLiteOpenHelper(appContext, "dictionary.db", null, 11) {
 
     /** 词频学习等写操作放到 IO 线程，避免主线程卡顿（用户上屏每个词都会触发） */
     private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -59,10 +59,17 @@ class DictionaryDatabase(private val appContext: Context) :
 
         /** 词语/成字词库资产文件（汉典成语 + 2-4 字词组，约 16 万条） */
         private const val ASSET_CN_WORDS = "cn_words.txt"
+        
+        /** 常用词升档表（拼音 词）：词组资产词频平坦（46-50），同音组内排序退化为入库序，
+         *  生僻词会排在常用词前面（如 儆鉴 先于 精简）；此表把精选常用词升到 COMMON_TIER */
+        private const val ASSET_COMMON_BOOST = "common_boost.txt"
 
         /** 用户词保护档：用户打过的词直接跳入此档，压过所有基础档位（手编词 90/单字 85/词组 50），
          *  之后再打则在档内 +1，几次即可稳定置顶 */
         private const val USER_TIER = 95
+
+        /** 常用词档：精选高频词（如 精简/时间）升至此档，高于资产词组平档 50、低于手编词 90 */
+        private const val COMMON_TIER = 88
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -94,6 +101,9 @@ class DictionaryDatabase(private val appContext: Context) :
 
         // Insert 词语/成字词库（汉典成语 + 2-4 字词组）
         loadAssetWords(db, ASSET_CN_WORDS)
+
+        // 常用词升档：纠正词组平档导致的同音组乱序（如 精简 排到 儆鉴 前）
+        boostCommonWords(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -106,6 +116,10 @@ class DictionaryDatabase(private val appContext: Context) :
             // 9→10：补录高频短语种子（存量词库不重建，仅追加新词条）
             if (oldVersion < 10) {
                 insertPhraseSeeds(db)
+            }
+            // 10→11：常用词升档（同音组乱序修复，存量用户无需重装）
+            if (oldVersion < 11) {
+                boostCommonWords(db)
             }
         } else {
             db.execSQL("DROP TABLE IF EXISTS $TABLE_WORDS")
@@ -944,6 +958,35 @@ class DictionaryDatabase(private val appContext: Context) :
             put(COL_DIGITS, toDigits(pinyin))
         }
         db.insertWithOnConflict(TABLE_WORDS, null, values, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    /**
+     * 常用词升档：按资产表把精选高频词升到 COMMON_TIER。
+     * 仅升不降（词频已 >= COMMON_TIER 的不动，保护手编词/用户学习成果）；事务 + 预编译批量更新。
+     */
+    private fun boostCommonWords(db: SQLiteDatabase) {
+        val lines = try {
+            appContext.assets.open(ASSET_COMMON_BOOST).bufferedReader().use { it.readLines() }
+        } catch (e: Exception) {
+            return
+        }
+        val update = db.compileStatement(
+            "UPDATE $TABLE_WORDS SET $COL_FREQ = $COMMON_TIER WHERE $COL_PINYIN = ? AND $COL_WORD = ? AND $COL_FREQ < $COMMON_TIER"
+        )
+        db.beginTransaction()
+        try {
+            for (line in lines) {
+                val parts = line.split(' ')
+                if (parts.size != 2) continue
+                update.bindString(1, parts[0])
+                update.bindString(2, parts[1])
+                update.executeUpdateDelete()
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+            update.close()
+        }
     }
 
     /**
