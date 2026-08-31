@@ -10,7 +10,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 class DictionaryDatabase(private val appContext: Context) :
-    SQLiteOpenHelper(appContext, "dictionary.db", null, 12) {
+    SQLiteOpenHelper(appContext, "dictionary.db", null, 13) {
 
     /** 词频学习等写操作放到 IO 线程，避免主线程卡顿（用户上屏每个词都会触发） */
     private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -68,12 +68,19 @@ class DictionaryDatabase(private val appContext: Context) :
          *  在同音组被一堆同档字排后；按使用频率赋 91~94 修正 */
         private const val ASSET_CHAR_BOOST = "char_boost.txt"
 
+        /** 多音字补丁表（拼音 字）：单字资产多数只收一个读音（如 行 只有 xing），
+         *  补入常用缺失读音（hang 行 等），否则用户打另一读音永远出不来该字 */
+        private const val ASSET_MULTI_PRON = "multi_pron.txt"
+
         /** 用户词保护档：用户打过的词直接跳入此档，压过所有基础档位（手编词 90/单字 85/词组 50），
          *  之后再打则在档内 +1，几次即可稳定置顶 */
         private const val USER_TIER = 95
 
         /** 常用词档：精选高频词（如 精简/时间）升至此档，高于资产词组平档 50、低于手编词 90 */
         private const val COMMON_TIER = 88
+
+        /** 多音字补丁读音档：补入的次常用读音置于此档，能进同音组前列但不压过主读音 */
+        private const val MULTI_PRON_TIER = 88
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -114,6 +121,9 @@ class DictionaryDatabase(private val appContext: Context) :
 
         // 重复词条归一：手编连写拼音与资产分隔拼音同词并存 -> 合并为分隔拼音单条
         normalizeWordDuplicates(db)
+
+        // 多音字补丁：补入单字资产缺失的常用读音（如 hang 行）
+        insertMultiPron(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -136,6 +146,12 @@ class DictionaryDatabase(private val appContext: Context) :
                 boostCommonChars(db)
                 normalizeWordDuplicates(db)
             }
+            // 12→13：多音字补丁 + 补录 V+起来 短语种子（insertPhraseSeeds 幂等，
+            // 已存在的种子遇 UNIQUE 冲突静默跳过）
+            if (oldVersion < 13) {
+                insertMultiPron(db)
+                insertPhraseSeeds(db)
+            }
         } else {
             db.execSQL("DROP TABLE IF EXISTS $TABLE_WORDS")
             onCreate(db)
@@ -147,13 +163,30 @@ class DictionaryDatabase(private val appContext: Context) :
      * 独立于 commonWords，便于升级路径对存量词库补录（db.insert 遇 UNIQUE 冲突返回 -1，静默跳过）
      */
     private fun insertPhraseSeeds(db: SQLiteDatabase) {
-        // 拼音用音节分隔符格式（与资产词条一致），保证与 learnPhrase 入库格式同构、读法成词加成可命中
+        // 拼音用音节分隔符格式（与资产词条一致），保证与 learnPhrase 入库格式同构、读法成词加成可命中；
+        // V+起来 为日常高频口语组合（词组资产缺失），入种子后精确命中置顶，
+        // 且续打阶段可被前缀查询带出（如打 966474 已可见 用起来）
         val phrases = mapOf(
             "gei'wo" to "给我",
             "gei'ni" to "给你",
             "gei'ta" to "给他",
             "gei'ta'men" to "给他们",
-            "gei'wo'men" to "给我们"
+            "gei'wo'men" to "给我们",
+            "yong'qi'lai" to "用起来",
+            "kan'qi'lai" to "看起来",
+            "ting'qi'lai" to "听起来",
+            "shuo'qi'lai" to "说起来",
+            "zuo'qi'lai" to "做起来",
+            "xiang'qi'lai" to "想起来",
+            "zhan'qi'lai" to "站起来",
+            "na'qi'lai" to "拿出来",
+            "chi'qi'lai" to "吃起来",
+            "he'qi'lai" to "喝起来",
+            "xie'qi'lai" to "写起来",
+            "du'qi'lai" to "读起来",
+            "gan'qi'lai" to "干起来",
+            "pao'qi'lai" to "跑起来",
+            "xiao'qi'lai" to "笑起来"
         )
         phrases.forEach { (pinyin, word) ->
             val values = ContentValues().apply {
@@ -1000,6 +1033,46 @@ class DictionaryDatabase(private val appContext: Context) :
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
+            update.close()
+        }
+    }
+
+    /**
+     * 多音字补丁：按资产表（拼音 字）插入单字缺失的常用读音。
+     * INSERT OR IGNORE 幂等；补入读音统一置 MULTI_PRON_TIER 档。
+     */
+    private fun insertMultiPron(db: SQLiteDatabase) {
+        val lines = try {
+            appContext.assets.open(ASSET_MULTI_PRON).bufferedReader().use { it.readLines() }
+        } catch (e: Exception) {
+            return
+        }
+        val insert = db.compileStatement(
+            "INSERT OR IGNORE INTO $TABLE_WORDS($COL_PINYIN, $COL_WORD, $COL_FREQ, $COL_DIGITS) VALUES(?,?,?,?)"
+        )
+        val update = db.compileStatement(
+            "UPDATE $TABLE_WORDS SET $COL_FREQ = $MULTI_PRON_TIER WHERE $COL_PINYIN = ? AND $COL_WORD = ? AND $COL_FREQ < $MULTI_PRON_TIER"
+        )
+        db.beginTransaction()
+        try {
+            for (line in lines) {
+                val parts = line.split(' ')
+                if (parts.size != 2) continue
+                val pinyin = parts[0]
+                val word = parts[1]
+                insert.bindString(1, pinyin)
+                insert.bindString(2, word)
+                insert.bindLong(3, MULTI_PRON_TIER.toLong())
+                insert.bindString(4, toDigits(pinyin))
+                insert.executeInsert()
+                update.bindString(1, pinyin)
+                update.bindString(2, word)
+                update.executeUpdateDelete()
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+            insert.close()
             update.close()
         }
     }

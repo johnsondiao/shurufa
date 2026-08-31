@@ -16,7 +16,23 @@
         android:paddingStart="8dp"
         android:paddingEnd="4dp" />
 
-    <!-- 候选字行（单独一行，横向滚动；拼音回显作为首项内嵌在候选栏） -->
+    <!-- 拼音回显行（独立一行，位于候选字上一行；长句单行省略） -->
+    <TextView
+        android:id="@+id/pinyinDisplay"
+        android:layout_width="match_parent"
+        android:layout_height="32dp"
+        android:background="@color/candidate_bg_light"
+        android:gravity="center_vertical"
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp"
+        android:maxLines="1"
+        android:ellipsize="end"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:textColor="#1E8E3E"
+        android:visibility="gone" />
+
+    <!-- 候选字行（单独一行，横向滚动） -->
     <HorizontalScrollView
         android:id="@+id/candidateScrollView"
         android:layout_width="match_parent"

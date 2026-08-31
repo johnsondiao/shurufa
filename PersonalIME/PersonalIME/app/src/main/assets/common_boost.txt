@@ -22,6 +22,7 @@ bian'liang 变量
 biao'ge 表格
 biao'zhun 标准
 bie'ren 别人
+bu'dao 不到
 bu'fen 部分
 bu'guo 不过
 bu'ju 布局
@@ -51,6 +52,7 @@ chu'chai 出差
 chu'fa 出发
 chu'le 除了
 chu'li 处理
+chu'qu 出去
 ci'wai 此外
 cong'lai 从来
 cun'chu 存储
@@ -81,6 +83,7 @@ dong'hua 动画
 dong'li 动力
 dong'xi 东西
 du'che 堵车
+du'chu 读出
 duan'lian 锻炼
 dui'lie 队列
 dui'mian 对面
@@ -139,7 +142,9 @@ gui'fan 规范
 gui'lv 规律
 gui'mo 规模
 gui'ze 规则
+guo'lai 过来
 guo'lv 过滤
+guo'qu 过去
 hai'shi 还是
 hai'zi 孩子
 han'shu 函数
@@ -153,6 +158,7 @@ huan'jing 环境
 huan'ying 欢迎
 hui'bao 汇报
 hui'jia 回家
+hui'lai 回来
 hui'yi 会议
 hui'yuan 会员
 huo'dong 活动
@@ -197,6 +203,8 @@ jie'shu 结束
 jie'zhe 接着
 jin'cheng 进程
 jin'guan 尽管
+jin'lai 进来
+jin'qu 进去
 jin'tian 今天
 jin'zhang 紧张
 jing'chang 经常
@@ -211,6 +219,7 @@ jue'ding 决定
 kai'hui 开会
 kai'shi 开始
 kai'xin 开心
+kan'chu 看出
 kao'lv 考虑
 kao'shi 考试
 ke'hu 客户
@@ -237,6 +246,7 @@ luo'ji 逻辑
 lv'you 旅游
 ma'shang 马上
 man'man 慢慢
+mei'le 没了
 mi'ma 密码
 ming'bai 明白
 ming'que 明确
@@ -244,6 +254,9 @@ ming'tian 明天
 mo'kuai 模块
 mu'biao 目标
 mu'lu 目录
+na'chu 拿出
+na'dao 拿到
+na'lai 拿来
 nan'guo 难过
 nei'cun 内存
 nei'rong 内容
@@ -263,6 +276,7 @@ pu'tong 普通
 qi'chuang 起床
 qi'ci 其次
 qi'guai 奇怪
+qi'lai 起来
 qing'chu 清楚
 qing'kuang 情况
 qing'qiu 请求
@@ -283,6 +297,8 @@ shan'chu 删除
 shang'ban 上班
 shang'chang 商场
 shang'chuan 上传
+shang'lai 上来
+shang'qu 上去
 shao'liang 少量
 she'bei 设备
 shen'he 审核
@@ -305,6 +321,7 @@ shu'liang 数量
 shua'xin 刷新
 shui'jiao 睡觉
 shui'ping 水平
+shuo'chu 说出
 sou'suo 搜索
 sui'ran 虽然
 suo'yi 所以
@@ -353,12 +370,15 @@ xi'tong 系统
 xi'wang 希望
 xi'zao 洗澡
 xia'ban 下班
+xia'lai 下来
+xia'qu 下去
 xia'xue 下雪
 xia'yu 下雨
 xia'zai 下载
 xian'cheng 线程
 xian'sheng 先生
 xian'zai 现在
+xiang'chu 想出
 xiang'fa 想法
 xiang'mu 项目
 xiang'si 相似
@@ -445,4 +465,5 @@ zong'shi 总是
 zu'gou 足够
 zu'jian 组件
 zui'hou 最后
+zuo'chu 做出
 zuo'tian 昨天

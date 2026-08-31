@@ -63,6 +63,7 @@ class PersonalIMEService : InputMethodService() {
     private var keyboardArea: LinearLayout? = null
     private var pinyinSelector: LinearLayout? = null
     private var pinyinSelectorScroll: ScrollView? = null
+    private var pinyinDisplay: TextView? = null
     private var candidateLayout: LinearLayout? = null
     private var candidateScrollView: HorizontalScrollView? = null
     private var shiftKey: Button? = null
@@ -159,6 +160,7 @@ class PersonalIMEService : InputMethodService() {
         keyboardArea = keyboardView.findViewById(com.personal.ime.R.id.keyboardArea)
         pinyinSelector = keyboardView.findViewById(com.personal.ime.R.id.pinyinSelector)
         pinyinSelectorScroll = keyboardView.findViewById(com.personal.ime.R.id.pinyinSelectorScroll)
+        pinyinDisplay = keyboardView.findViewById(com.personal.ime.R.id.pinyinDisplay)
         candidateLayout = keyboardView.findViewById(com.personal.ime.R.id.candidateLayout)
         candidateScrollView = keyboardView.findViewById(com.personal.ime.R.id.candidateScrollView)
         buildToolbar()
@@ -896,6 +898,7 @@ class PersonalIMEService : InputMethodService() {
 
         // 先记住上一次选择的拼音，清空后再用它恢复选中项（避免点击被重置回第一项）
         val previousSelection = selectedPinyin
+        pinyinDisplay?.visibility = View.GONE
         pinyinSelectorScroll?.scrollTo(0, 0)
         pinyinSelector?.removeAllViews()
         selectedPinyin = null
@@ -952,8 +955,11 @@ class PersonalIMEService : InputMethodService() {
             echoReading = allSplits.firstOrNull()
         }
 
-        // 拼音回显作为候选栏首项（仿微信输入法：回显与候选同行）
-        echoReading?.let { candidatesView.addView(createPinyinView(it)) }
+        // 拼音回显展示在独立一行（候选字上一行）
+        echoReading?.let {
+            pinyinDisplay?.text = it
+            pinyinDisplay?.visibility = View.VISIBLE
+        }
 
         val candidates = displayCandidates()
         candidates.forEachIndexed { index, candidate ->
