@@ -437,9 +437,21 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         database.learnPhrase(pinyin, word)
     }
 
+    /**
+     * 连续上屏组词学习：用户逐字/逐词连续上屏时拼出的新词入库（如 张→三 学会 张三）。
+     * 起始词频取 USER_COMPOSE_FREQ：高于资产词组平档 50（能进候选），
+     * 低于单字 85/常用词 88（不抢位）；再次选中时常规学习升入用户保护档 95。
+     */
+    fun learnUserWord(pinyin: String, word: String) {
+        database.learnUserWord(pinyin, word, USER_COMPOSE_FREQ)
+    }
+
     companion object {
         // 覆盖率实测：20 条时 23.8% 词条不可达，60 条时仅 4.5%（超大同音组尾部）
         private const val CANDIDATE_LIMIT = 60
+
+        /** 连续上屏组词的起始学习词频 */
+        private const val USER_COMPOSE_FREQ = 60
 
         /** 拼音最长字母数（zhuang/chuang = 6） */
         private const val MAX_PINYIN_LEN = 6

@@ -1141,6 +1141,28 @@ class DictionaryDatabase(private val appContext: Context) :
     }
 
     /**
+     * 用户连续上屏组词学习：新词以指定词频插入，幂等；
+     * 若词已存在但词频低于该值（资产平档词），一并升上来，让学习立即可见。
+     * 用户再次选中它时，常规学习（incrementFrequency）将其升入用户保护档——误学的垃圾词不会被再次选中，自然沉淀。
+     */
+    fun learnUserWord(pinyin: String, word: String, freq: Int) {
+        ioScope.launch {
+            val db = writableDatabase
+            val values = ContentValues().apply {
+                put(COL_PINYIN, pinyin.lowercase())
+                put(COL_WORD, word)
+                put(COL_FREQ, freq)
+                put(COL_DIGITS, toDigits(pinyin))
+            }
+            db.insertWithOnConflict(TABLE_WORDS, null, values, SQLiteDatabase.CONFLICT_IGNORE)
+            db.execSQL(
+                "UPDATE $TABLE_WORDS SET $COL_FREQ = ? WHERE $COL_PINYIN = ? AND $COL_WORD = ? AND $COL_FREQ < ?",
+                arrayOf(freq, pinyin.lowercase(), word, freq)
+            )
+        }
+    }
+
+    /**
      * 学习用户组合新词（整句候选上屏时调用）：
      * 词库没有则新建（直接入用户保护档），已有则升档/+1。
      * 用 CONFLICT_IGNORE + UPDATE，避免 REPLACE 把已有词条词频清零重建。

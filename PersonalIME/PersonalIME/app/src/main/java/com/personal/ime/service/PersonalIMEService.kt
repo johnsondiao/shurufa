@@ -85,6 +85,9 @@ class PersonalIMEService : InputMethodService() {
     /** 联想候选：上屏中文词后展示以它开头的更长词（模拟主流输入法下文推荐） */
     private var associationCandidates: List<PinyinEngine.Candidate> = emptyList()
 
+    /** 连续上屏组词学习缓冲：连续的中文上屏拼成新词入库（张→三 学会 张三） */
+    private val learnBuffer = mutableListOf<PinyinEngine.Candidate>()
+
     /** 表情面板浮层（底行 表情 键弹出，点表情上屏且面板保持打开） */
     private var emojiPopup: PopupWindow? = null
 
@@ -196,6 +199,7 @@ class PersonalIMEService : InputMethodService() {
         feedbackManager.vibrate(vibrationStrength)
         isPrivacyMode = !isPrivacyMode
         serviceScope.launch { preferencesManager.setPrivacyMode(isPrivacyMode) }
+        resetLearnBuffer()
         buildToolbar()
     }
 
@@ -571,6 +575,7 @@ class PersonalIMEService : InputMethodService() {
         keyboardPage = KeyboardPage.T9
         isShifted = false
         associationCandidates = emptyList()
+        resetLearnBuffer()
         rebuildKeyboard()
         updateCandidates()
     }
@@ -586,6 +591,7 @@ class PersonalIMEService : InputMethodService() {
         keyboardPage = KeyboardPage.T9
         isShifted = false
         associationCandidates = emptyList()
+        resetLearnBuffer()
         rebuildKeyboard()
         updateCandidates()
     }
@@ -602,6 +608,7 @@ class PersonalIMEService : InputMethodService() {
         keyboardPage = KeyboardPage.T9
         isShifted = false
         associationCandidates = emptyList()
+        resetLearnBuffer()
         rebuildKeyboard()
         updateCandidates()
     }
@@ -683,6 +690,7 @@ class PersonalIMEService : InputMethodService() {
                 ).apply { bottomMargin = (2 * density).toInt() }
                 setOnClickListener {
                     currentInputConnection?.commitText(item, 1)
+                    resetLearnBuffer()
                     dismissClipboardPopup()
                 }
             }
@@ -759,7 +767,10 @@ class PersonalIMEService : InputMethodService() {
                     gravity = Gravity.CENTER
                     layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
                     // 只上屏不刷新候选，面板保持打开支持连发；打字时由 updateCandidates 自动收起
-                    setOnClickListener { currentInputConnection?.commitText(emoji, 1) }
+                    setOnClickListener {
+                        currentInputConnection?.commitText(emoji, 1)
+                        resetLearnBuffer()
+                    }
                 })
             }
             grid.addView(row)
@@ -806,6 +817,8 @@ class PersonalIMEService : InputMethodService() {
             updateCandidates()
         } else {
             currentInputConnection?.deleteSurroundingText(1, 0)
+            // 删除已上屏内容 = 打断组词上下文（缓冲里的字可能已被删）
+            resetLearnBuffer()
         }
     }
 
@@ -818,6 +831,7 @@ class PersonalIMEService : InputMethodService() {
                 return
             }
             currentInputConnection?.commitText(" ", 1)
+            resetLearnBuffer()
             return
         }
         if (inputMode == InputMode.CHINESE_T9) {
@@ -843,6 +857,7 @@ class PersonalIMEService : InputMethodService() {
             }
         } else {
             sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
+            resetLearnBuffer()
         }
     }
 
@@ -874,7 +889,9 @@ class PersonalIMEService : InputMethodService() {
             }
         }
         currentInputConnection?.commitText(text, 1)
-        // 标点/数字打断上下文，清空联想候选并同步候选栏
+        // 标点/数字打断上下文：清空联想候选与组词缓冲并同步候选栏。
+        // 注意在上面 flush 之后清，保证刚被冲出的候选已完成组词入缓冲。
+        resetLearnBuffer()
         if (associationCandidates.isNotEmpty()) {
             associationCandidates = emptyList()
             updateCandidates()
@@ -1095,6 +1112,35 @@ class PersonalIMEService : InputMethodService() {
         // 联想：推荐以上屏词为前缀的更长词（主流输入法下文推荐），无命中则为空
         associationCandidates = pinyinEngine.associate(candidate.text)
         updateCandidates()
+        appendLearnBuffer(candidate)
+    }
+
+    /**
+     * 连续上屏组词学习：把本次上屏追加到学习缓冲，累计 >=2 字时将整串作为新词入库。
+     * 只收纯中文、拼音完整的普通候选（整句候选已由 learnPhrase 学习，不重复入库）；
+     * 总长超 8 字时丢弃旧缓冲重新累计，避免学进垃圾长串。
+     * 新词起始词频 60：能进候选但不抢位；再次选中即升入用户保护档，误学词自然沉淀。
+     */
+    private fun appendLearnBuffer(candidate: PinyinEngine.Candidate) {
+        if (isPrivacyMode) return
+        if (candidate.components.isNotEmpty()) return
+        if (candidate.pinyin.isEmpty()) return
+        if (!candidate.text.all { it in '\u4E00'..'\u9FFF' }) return
+        learnBuffer.add(candidate)
+        if (learnBuffer.sumOf { it.text.length } > 8) {
+            learnBuffer.clear()
+            learnBuffer.add(candidate)
+        }
+        if (learnBuffer.sumOf { it.text.length } >= 2) {
+            val word = learnBuffer.joinToString("") { it.text }
+            val pinyin = learnBuffer.joinToString("'") { it.pinyin }
+            pinyinEngine.learnUserWord(pinyin, word)
+        }
+    }
+
+    /** 打断连续上屏的事件（标点/空格/换行/英文/删除已上屏内容/切模式）清空组词缓冲 */
+    private fun resetLearnBuffer() {
+        learnBuffer.clear()
     }
 
     private fun commitEnglishText(text: String) {
@@ -1104,6 +1150,7 @@ class PersonalIMEService : InputMethodService() {
         }
         currentInput = ""
         associationCandidates = emptyList()
+        resetLearnBuffer()
         updateCandidates()
     }
 
