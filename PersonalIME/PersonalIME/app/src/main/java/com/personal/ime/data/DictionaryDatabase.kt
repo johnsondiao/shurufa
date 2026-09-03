@@ -10,7 +10,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 class DictionaryDatabase(private val appContext: Context) :
-    SQLiteOpenHelper(appContext, "dictionary.db", null, 14) {
+    SQLiteOpenHelper(appContext, "dictionary.db", null, 15) {
 
     /** 词频学习等写操作放到 IO 线程，避免主线程卡顿（用户上屏每个词都会触发） */
     private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -72,6 +72,11 @@ class DictionaryDatabase(private val appContext: Context) :
          *  补入常用缺失读音（hang 行 等），否则用户打另一读音永远出不来该字 */
         private const val ASSET_MULTI_PRON = "multi_pron.txt"
 
+        /** 真实词频分级表（词 频级名次）：来自《现代汉语常用词表》5.6 万词（2.5 亿字语料），
+         *  名次越小越常用。词组资产平档 50 无区分度，同音组内排序退化为拼音字母序，
+         *  生僻词（俵寄/猋急）排在常用词前——按频级分档注入真实常用度 */
+        private const val ASSET_WORD_FREQ = "word_freq.txt"
+
         /** 用户词保护档：用户打过的词直接跳入此档，压过所有基础档位（手编词 90/单字 85/词组 50），
          *  之后再打则在档内 +1，几次即可稳定置顶 */
         private const val USER_TIER = 95
@@ -113,7 +118,10 @@ class DictionaryDatabase(private val appContext: Context) :
         // Insert 词语/成字词库（汉典成语 + 2-4 字词组）
         loadAssetWords(db, ASSET_CN_WORDS)
 
-        // 常用词升档：纠正词组平档导致的同音组乱序（如 精简 排到 儆鉴 前）
+        // 真实词频分级：按《现代汉语常用词表》频级名次分档，治本解决同音组生僻词排前
+        applyWordFreqTiers(db)
+
+        // 常用词升档：精选表的补充（科技/办公词可能不在 5.6 万词表内）
         boostCommonWords(db)
 
         // 常用单字升档：纠正五档制档位失真（如 要 在自己组排第 14）
@@ -160,6 +168,10 @@ class DictionaryDatabase(private val appContext: Context) :
                 boostCommonChars(db)
                 insertMultiPron(db)
                 insertPhraseSeeds(db)
+            }
+            // 14→15：注入真实词频分级（5.6 万词按《现代汉语常用词表》频级分档）
+            if (oldVersion < 15) {
+                applyWordFreqTiers(db)
             }
         } else {
             db.execSQL("DROP TABLE IF EXISTS $TABLE_WORDS")
@@ -1034,6 +1046,49 @@ class DictionaryDatabase(private val appContext: Context) :
             put(COL_DIGITS, toDigits(pinyin))
         }
         db.insertWithOnConflict(TABLE_WORDS, null, values, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    /**
+     * 真实词频分级：按《现代汉语常用词表》频级名次给多字词分档。
+     * 档位设计：均高于资产平档 50（拉开区分度）、低于手编词 90 与用户档 95；
+     * 仅升不降，不覆盖已有高档位（种子/学习成果）；只处理 2+ 字词，
+     * 单字由 char_boost 专管，避免两套体系互相覆盖。
+     */
+    private fun applyWordFreqTiers(db: SQLiteDatabase) {
+        val lines = try {
+            appContext.assets.open(ASSET_WORD_FREQ).bufferedReader().use { it.readLines() }
+        } catch (e: Exception) {
+            return
+        }
+        val update = db.compileStatement(
+            "UPDATE $TABLE_WORDS SET $COL_FREQ = ? WHERE $COL_WORD = ? AND length($COL_WORD) >= 2 AND $COL_FREQ < ?"
+        )
+        db.beginTransaction()
+        try {
+            for (line in lines) {
+                val parts = line.split(' ')
+                if (parts.size != 2) continue
+                val rank = parts[1].toIntOrNull() ?: continue
+                val tier = tierForRank(rank)
+                update.bindLong(1, tier.toLong())
+                update.bindString(2, parts[0])
+                update.bindLong(3, tier.toLong())
+                update.executeUpdateDelete()
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+            update.close()
+        }
+    }
+
+    /** 频级名次 -> 词频档位：前 2000 名 88，逐档递减，榜内保底 62（高于资产平档 50） */
+    private fun tierForRank(rank: Int): Int = when {
+        rank <= 2000 -> 88
+        rank <= 8000 -> 84
+        rank <= 20000 -> 78
+        rank <= 40000 -> 70
+        else -> 62
     }
 
     /**
