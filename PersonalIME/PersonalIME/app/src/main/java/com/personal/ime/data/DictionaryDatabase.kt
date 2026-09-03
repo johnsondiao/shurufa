@@ -10,7 +10,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 class DictionaryDatabase(private val appContext: Context) :
-    SQLiteOpenHelper(appContext, "dictionary.db", null, 13) {
+    SQLiteOpenHelper(appContext, "dictionary.db", null, 14) {
 
     /** 词频学习等写操作放到 IO 线程，避免主线程卡顿（用户上屏每个词都会触发） */
     private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -149,6 +149,15 @@ class DictionaryDatabase(private val appContext: Context) :
             // 12→13：多音字补丁 + 补录 V+起来 短语种子（insertPhraseSeeds 幂等，
             // 已存在的种子遇 UNIQUE 冲突静默跳过）
             if (oldVersion < 13) {
+                insertMultiPron(db)
+                insertPhraseSeeds(db)
+            }
+            // 13→14：升档资产扩充（超级/知道/非常 等 + 超 字）。
+            // 升档操作全部幂等且仅升不降，存量用户重跑一遍即可拿到新增条目，
+            // 否则一次性门控（<11）会让已升级用户永远缺失后续扩充的词
+            if (oldVersion < 14) {
+                boostCommonWords(db)
+                boostCommonChars(db)
                 insertMultiPron(db)
                 insertPhraseSeeds(db)
             }
@@ -984,6 +993,25 @@ class DictionaryDatabase(private val appContext: Context) :
             }
         }
         return words
+    }
+
+    /** 拼音精确匹配的最高词频词条（读法成词加成用）。
+     *  不能用 queryWords 的前缀 GLOB：biao'ji* 会误命中 biao'jie（表姐），
+     *  把非词读法的加成算成更长词的词频，导致读法排序错乱 */
+    fun queryTopWordByPinyinExact(pinyin: String): Pair<String, Int>? {
+        val db = readableDatabase
+        db.query(
+            TABLE_WORDS,
+            arrayOf(COL_WORD, COL_FREQ),
+            "$COL_PINYIN = ?",
+            arrayOf(pinyin),
+            null, null,
+            "$COL_FREQ DESC",
+            "1"
+        ).use { c ->
+            if (c.moveToFirst()) return c.getString(0) to c.getInt(1)
+        }
+        return null
     }
 
     /** 按拼音提升词频（用户选词学习）。异步执行 + pinyin 索引，不阻塞主线程。

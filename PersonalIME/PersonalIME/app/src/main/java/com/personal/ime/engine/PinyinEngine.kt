@@ -344,10 +344,12 @@ class PinyinEngine(private val database: DictionaryDatabase) {
                 reps.append(w)
                 pos += syl.length
             }
-            // 整读法成词加成：读法本身就是词库词条时（如 che tui = 撤退），
-            // 加该词词频，使真词读法压过同音节数的非词读法（如 bie tui）
-            val fullWord = database.queryWords(reading.replace(" ", "'"), 1).firstOrNull()
-            if (fullWord != null) total += fullWord.second
+            // 整读法成词加成（双倍权重，拼音精确匹配）：读法本身就是词库词条时（如 chao ji = 超级），
+            // 加该词词频×2——真词读法必须显著压过“只代表字频高”的拼字读法。
+            // 必须精确匹配：前缀 GLOB 会误命中更长词（biao'ji* → 表姐 biao'jie），
+            // 把非词读法顶到第一，导致 242654 默认 biao ji 而 超级 被压到第二读法
+            val fullWord = database.queryTopWordByPinyinExact(reading.replace(" ", "'"))
+            if (fullWord != null) total += fullWord.second * 2
             score[reading] = total
             repText[reading] = reps.toString()
         }
