@@ -1,6 +1,7 @@
 package com.personal.ime.engine
 
 import com.personal.ime.data.DictionaryDatabase
+import com.personal.ime.data.WordEntry
 
 /**
  * T9 拼音引擎：基于数字序列前缀匹配。
@@ -10,16 +11,28 @@ import com.personal.ime.data.DictionaryDatabase
  * - 渐进输入：每按一键都有候选，无需等音节打完
  * - 续打匹配：输入 6364 也能命中更长的 能不能（其数字序列以 6364 开头）
  * - 半音节容忍：输入 63642（neng + b 一半）仍能保持 能不能 在候选中
+ *
+ * ## 打分量纲（相对旧版的关键变化）
+ * 旧版候选按整数 `frequency` 排序，而该字段由 15 个互不统一的魔法档位写入，
+ * 5.5 万词被压进 8 个离散值 -> 同音组内大量并列 -> 排序退化为数据库返回顺序
+ * （用户感受就是"随机"，「你好」被同档生僻词挤到第 6 就是这种并列造成的）。
+ *
+ * 新版 `score` 是**毫纳特（ln 概率 × 1000）连续值**，由离线流水线产出：
+ *   多层证据（常用词表 + 口语词 + 现代词 + 领域词 + 字符级回退）加权混合。
+ * 同一量纲下可以直接相加，为后续 bigram / 用户模型留好了接口。
  */
 class PinyinEngine(private val database: DictionaryDatabase) {
 
-    /** components 仅整句候选使用：存各组成词的拼音（如 "che"、"tui"），上屏时逐词学习词频；
-     *  matchTier 记录匹配层级（0=恰好打完），供展示层把打完的词置顶；
-     *  componentWords 与 components 一一对应存词条本身——逐词学习必须带词，
-     *  只给拼音会把同音异义词一并抬进用户档（「给我」的 gei'wo 若同组还有他词会被误伤） */
+    /**
+     * @param score 毫纳特：基础 logp + 用户偏好加成，越大越优
+     * @param components 仅整句候选使用：各组成词的拼音（上屏时逐词学习偏好）
+     * @param componentWords 与 components 一一对应，存词条本身——
+     *        逐词学习必须带词，只给拼音会把同音异义词一并抬上去
+     * @param matchTier 匹配层级（0=恰好打完），供展示层把打完的词置顶
+     */
     data class Candidate(
         val text: String,
-        val frequency: Int,
+        val score: Int,
         val pinyin: String = "",
         val components: List<String> = emptyList(),
         val matchTier: Int = 2,
@@ -61,7 +74,7 @@ class PinyinEngine(private val database: DictionaryDatabase) {
 
     fun inputT9(digits: String): List<Candidate> {
         if (digits.isEmpty()) return emptyList()
-        // 词库尚未完成首次导入时由调用方展示提示，这里直接返回空避免阻塞主线程
+        // 词库尚未完成安装/挂载时由调用方展示提示，这里直接返回空避免阻塞主线程
         if (!database.isReady) return emptyList()
 
         // 分隔符（'）切出强制音节边界：记录数字长累计位置，如 94'26 -> [2, 4]
@@ -77,53 +90,44 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         val plain = digits.filter { it != '\'' }
 
         // LinkedHashMap 保持插入序：恰好打完的词最先加入，排序时同层内稳定有序。
-        // key=词条，value=(词频, 拼音, matchTier)；tier 0=恰好打完 1=已打部分 2=续打更长，
-        // 主流输入法的第一规则：“打完的词置顶”，否则会被大量前缀词/高频单字淹没（如 撤退/词 打不出）
+        // key=词条，value=(分数, 拼音, matchTier)；tier 0=恰好打完 1=已打部分 2=续打更长，
+        // 主流输入法的第一规则："打完的词置顶"，否则会被大量前缀词/高频单字淹没
         val merged = LinkedHashMap<String, Triple<Int, String, Int>>()
 
-        // 1) 恰好打完：数字与词条完全相等 —— 最高优先（如 243884 = 撤退）。
-        //    同音组可达 260+ 条（如 94=xi/yi/zi），与最终展示窗口 60 对齐；
-        //    全量覆盖率模拟：取 16 时 23.8% 词条打不出，取 60 降至 ~4.5%
-        database.queryByDigitsExact(plain, 60)
-            .filter { (word, pinyin, _) ->
-                word.any { it in '\u4E00'..'\u9FFF' } && matchesBoundaries(pinyin, boundaries)
+        fun absorb(entries: List<WordEntry>, tier: Int) {
+            for (e in entries) {
+                if (e.word.none { it in '\u4E00'..'\u9FFF' }) continue
+                if (!matchesBoundaries(e.pinyin, boundaries)) continue
+                val prev = merged[e.word]
+                if (prev == null || tier < prev.third) merged[e.word] = Triple(e.score, e.pinyin, tier)
             }
-            .forEach { (word, pinyin, freq) -> merged[word] = Triple(freq, pinyin, 0) }
+        }
+
+        // 1) 恰好打完：数字与词条完全相等 —— 最高优先（如 243884 = 撤退）。
+        //    同音组可达 260+ 条（如 94=xi/yi/zi），与最终展示窗口 60 对齐
+        absorb(database.queryExact(plain, CANDIDATE_LIMIT), 0)
 
         // 2) 已打部分：从长到短找已完整输入的最长前缀，短词在续打时仍可见；
         //    恰好打完有结果时跳过（避免短词抢占名额）
-        if (!merged.any { it.value.third == 0 }) {
+        if (merged.values.none { it.third == 0 }) {
             for (p in plain.length - 1 downTo 1) {
-                val exact = database.queryByDigitsExact(plain.substring(0, p), 16)
-                    .filter { (word, pinyin, _) ->
-                        word.any { it in '\u4E00'..'\u9FFF' } && matchesBoundaries(pinyin, boundaries)
-                    }
-                if (exact.isNotEmpty()) {
-                    exact.forEach { (word, pinyin, freq) ->
-                        if (word !in merged) merged[word] = Triple(freq, pinyin, 1)
-                    }
+                val exact = database.queryExact(plain.substring(0, p), PREFIX_EXACT_LIMIT)
+                if (exact.any { it.word.any { c -> c in '\u4E00'..'\u9FFF' } }) {
+                    absorb(exact, 1)
                     break
                 }
             }
         }
 
-        // 3) 续打匹配：数字序列以输入开头的更长词；已有更高优先级的词不降级覆盖，
-        //    多取一些再截断（边界验证会淘汰部分候选）
-        database.queryByDigitsPrefix(plain, 96)
-            .filter { (word, pinyin, _) ->
-                word.any { it in '\u4E00'..'\u9FFF' } && matchesBoundaries(pinyin, boundaries)
-            }
-            .forEach { (word, pinyin, freq) ->
-                if (word !in merged) merged[word] = Triple(freq, pinyin, 2)
-            }
+        // 3) 续打匹配：数字序列以输入开头的更长词；已有更高优先级的词不降级覆盖
+        absorb(database.queryPrefix(plain, CONTINUE_LIMIT), 2)
 
         return merged.entries
             .map { Candidate(it.key, it.value.first, it.value.second, emptyList(), it.value.third) }
             .sortedWith(
-                // 匹配层级升序（打完的词置顶）；层内词频降序；同频短词优先。
-                // LinkedHashMap 插入序保证同层同频内“恰好打完”的词条稳定靠前。
+                // 匹配层级升序（打完的词置顶）；层内分数降序；同分短词优先
                 compareBy<Candidate> { c -> merged[c.text]?.third ?: 2 }
-                    .thenByDescending { it.frequency }
+                    .thenByDescending { it.score }
                     .thenBy { it.text.length }
             )
             .take(CANDIDATE_LIMIT)
@@ -131,12 +135,16 @@ class PinyinEngine(private val database: DictionaryDatabase) {
 
     /**
      * 整句/组合候选：把整串数字切分成若干词库词条的组合（覆盖全部输入）。
-     * 如 548744... -> “就是完整的”。用 DP 找“词数最少、词频最高”的若干切分，
-     * 让用户连续打字（不按空格断词）也能出多词组合候选。
+     * 如 548744... -> "就是完整的"。
+     *
+     * ## 打分（相对旧版的关键变化）
+     * 旧版 `score/segments + n`（n = 输入数字长度）是个纯凑参数的启发式：
+     * 两条路径的分数不可比，且随输入长度漂移。
+     * 新版改成**累加对数概率**——`Σ logp(词)` 就是该切分方案的对数概率，
+     * 不同切分覆盖同一串数字，因此可直接比较。这也是启用 bigram 的前置条件。
      */
     fun sentenceCandidates(digits: String, limit: Int = 3): List<Candidate> {
-        // 分词键（'）切出强制音节边界：整句切分的词边界必须落在这些位置上，
-        // 与 inputT9 的边界语义保持一致（94'26 只出 xi'an 类组合，排除 xian 类）
+        // 分词键（'）切出强制音节边界：整句切分的词边界必须落在这些位置上
         val boundaries = mutableListOf<Int>()
         var acc = 0
         for (ch in digits) {
@@ -151,9 +159,6 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         // 太短无组合意义；过长控制 DP 开销；词库未就绪不查
         if (n < 4 || n > 16 || !database.isReady) return emptyList()
 
-        // 得分 = 段均词频 + 数字长度加成：高频组合优先，且不会让低频单字词组（如 嗚嗚）
-        // 靠“段数少”挤掉高频两段组合（如 给我=85+90）——旧规则“段数优先”曾导致 给我 打不出。
-        // 同分时保留段数少者优先（倾向整词）
         data class Path(
             val segments: Int, val score: Int, val text: String, val pinyin: String,
             val components: List<String>, val componentWords: List<String>
@@ -161,45 +166,39 @@ class PinyinEngine(private val database: DictionaryDatabase) {
 
         val dp = Array(n + 1) { mutableListOf<Path>() }
         dp[0].add(Path(0, 0, "", "", emptyList(), emptyList()))
-        val K = 3              // 每个位置保留的候选路径数（控制规模）
-        val MAX_WORD_DIGITS = 8 // 单词数字长上限（涵盖绝大多数 2-4 字词）
-        val WORDS_PER_SUB = 6   // 每个子串取的词条数上限
-        val cmp = compareByDescending<Path> { p ->
-            if (p.segments == 0) 0
-            else (p.score / p.segments) + n
-        }.thenBy { it.segments }
 
         for (i in 1..n) {
             val paths = mutableListOf<Path>()
             for (j in maxOf(0, i - MAX_WORD_DIGITS) until i) {
-                // 强制边界不能落在词内部：跨边界的 (j, i) 切分直接跳过，
-                // 这样合法切分必然在每个边界处断词
+                // 强制边界不能落在词内部：跨边界的 (j, i) 切分直接跳过
                 if (boundaries.any { it > j && it < i }) continue
                 val prevList = dp[j]
                 if (prevList.isEmpty()) continue
-                val sub = plain.substring(j, i)
-                val words = database.queryByDigitsExact(sub, WORDS_PER_SUB)
+                val words = database.queryExact(plain.substring(j, i), WORDS_PER_SUB)
                 if (words.isEmpty()) continue
                 for (prev in prevList) {
-                    for ((word, pinyin, freq) in words) {
-                        if (!word.any { it in '\u4E00'..'\u9FFF' }) continue
+                    for (w in words) {
+                        if (w.word.none { it in '\u4E00'..'\u9FFF' }) continue
                         paths.add(
                             Path(
                                 prev.segments + 1,
-                                prev.score + freq,
-                                prev.text + word,
-                                if (prev.pinyin.isEmpty()) pinyin else prev.pinyin + "'" + pinyin,
-                                prev.components + pinyin,
-                                prev.componentWords + word
+                                prev.score + w.score,
+                                prev.text + w.word,
+                                if (prev.pinyin.isEmpty()) w.pinyin else prev.pinyin + "'" + w.pinyin,
+                                prev.components + w.pinyin,
+                                prev.componentWords + w.word
                             )
                         )
                     }
                 }
             }
-            dp[i] = paths.sortedWith(cmp).take(K).toMutableList()
+            // 累计对数概率降序（分数是负数，越大越优）；同分取段数少者（倾向整词）
+            dp[i] = paths.sortedWith(
+                compareByDescending<Path> { it.score }.thenBy { it.segments }
+            ).take(K).toMutableList()
         }
 
-        // segments>=2 才是真正的“组合”（单词候选已由 inputT9 覆盖）
+        // segments>=2 才是真正的"组合"（单词候选已由 inputT9 覆盖）
         return dp[n]
             .filter { it.segments >= 2 }
             .map { Candidate(it.text, it.score, it.pinyin, it.components, componentWords = it.componentWords) }
@@ -228,29 +227,24 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         val dbPrefix = selected.split(' ').firstOrNull()?.replace("'", "") ?: selKey
 
         val merged = LinkedHashMap<String, Triple<Int, String, Int>>()
-        // 1) 恰好打完：数字相等 + 拼音以选中读法开头（DB 层过滤）
-        database.queryByDigitsExactAndPinyin(plain, dbPrefix, limit)
-            .filter { (word, pinyin, _) ->
-                word.any { it in '\u4E00'..'\u9FFF' } && matchesBoundaries(pinyin, boundaries)
-                        && pinyin.replace("'", "").startsWith(selKey)
+        fun absorb(entries: List<WordEntry>, tier: Int) {
+            for (e in entries) {
+                if (e.word.none { it in '\u4E00'..'\u9FFF' }) continue
+                if (!matchesBoundaries(e.pinyin, boundaries)) continue
+                if (!e.pinyin.replace("'", "").startsWith(selKey)) continue
+                val prev = merged[e.word]
+                if (prev == null || tier < prev.third) merged[e.word] = Triple(e.score, e.pinyin, tier)
             }
-            .forEach { (word, pinyin, freq) -> merged[word] = Triple(freq, pinyin, 0) }
+        }
 
-        // 2) 续打：以输入开头的更长词，同样按选中读法过滤；已有词不降级覆盖
-        database.queryByDigitsPrefix(plain, 96)
-            .filter { (word, pinyin, _) ->
-                word.any { it in '\u4E00'..'\u9FFF' } && matchesBoundaries(pinyin, boundaries)
-                        && pinyin.replace("'", "").startsWith(selKey)
-            }
-            .forEach { (word, pinyin, freq) ->
-                if (word !in merged) merged[word] = Triple(freq, pinyin, 2)
-            }
+        absorb(database.queryExactAndPinyin(plain, dbPrefix, limit), 0)
+        absorb(database.queryPrefix(plain, CONTINUE_LIMIT), 2)
 
         return merged.entries
             .map { Candidate(it.key, it.value.first, it.value.second, emptyList(), it.value.third) }
             .sortedWith(
                 compareBy<Candidate> { c -> merged[c.text]?.third ?: 2 }
-                    .thenByDescending { it.frequency }
+                    .thenByDescending { it.score }
                     .thenBy { it.text.length }
             )
             .take(limit)
@@ -274,7 +268,6 @@ class PinyinEngine(private val database: DictionaryDatabase) {
             return boundaries.all { it in lens }
         }
         val n = pinyin.length
-        // reachable[i]：前 i 个字母可完整切分为有效音节
         val reachable = BooleanArray(n + 1)
         reachable[0] = true
         for (i in 1..n) {
@@ -292,7 +285,6 @@ class PinyinEngine(private val database: DictionaryDatabase) {
     /**
      * 候选栏拼音回显：把 T9 数字串分段为可读拼音（音节间空格分隔）。
      * 例如 42638 -> ["gao du"]；尾部尚不成音节时返回已解析出的最长部分。
-     * 输入含强制分隔符（94'26）时，各段独立取默认切分后拼接。
      */
     fun pinyinSplits(digits: String, limit: Int = 3): List<String> {
         if (digits.isEmpty()) return emptyList()
@@ -307,7 +299,6 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         if (full.isNotEmpty()) {
             return rankSplits(full.distinct(), digits).take(limit)
         }
-        // 整串不可分段：回退到最长的可完整分段前缀（排序用同一前缀的数字串）
         for (i in digits.length - 1 downTo 1) {
             val prefix = digits.substring(0, i)
             val prefixSplits = fullSplits(prefix)
@@ -317,31 +308,21 @@ class PinyinEngine(private val database: DictionaryDatabase) {
     }
 
     /**
-     * 读法排序：音节数少的优先；同音节数内按“该读法实际能打出的首选字/词”词频降序（而非字母序），
-     * 读法顺序与用户选中后实际看到的候选一致（如 243884 的 che tui 因“撤”排前）。
+     * 读法排序：音节数少的优先；同音节数内按"该读法实际能打出的首选字/词"的 logp 之和降序。
+     * 读法顺序与用户选中后实际看到的候选一致（如 243884 的 che tui 因"撤"排前）。
+     *
+     * 旧版用"代表字词频 ×2"做整读法成词加成，在 logp 量纲下"乘 2"没有意义
+     * （负数的 2 倍反而更低），改为**加法奖励**：读法本身是词库词条时给固定加成。
      */
     private fun rankSplits(splits: List<String>, digits: String): List<String> {
         if (splits.size <= 1) return splits
         if (!database.isReady) return splits.sortedBy { it.count { c -> c == ' ' } }
 
-        // (数字子串, 音节) -> 该音节在该数字段下的代表字/词（词频最高）；
-        // 同一数字段常被多个读法共享，查询结果按音节缓存，总查询数有界（<=20 次索引查询）
-        val repCache = HashMap<String, Pair<String, Int>>()
-        fun representative(syllable: String, start: Int, end: Int): Pair<String, Int> =
-            repCache.getOrPut(syllable + "@" + start) {
-                val best = database.queryByDigitsExact(digits.substring(start, end), 40)
-                    .filter { (word, pinyin, _) ->
-                        word.any { it in '\u4E00'..'\u9FFF' } &&
-                                pinyin.replace("'", "") == syllable
-                    }
-                    .firstOrNull()
-                if (best != null) {
-                    best.first to best.third
-                } else {
-                    // 数字段下无该音节的字（理论上不应发生）：回退拼音前缀查询并降权，避免垃圾读法上位
-                    val top = database.queryWords(syllable, 1).firstOrNull()
-                    if (top != null) top.first to top.second - 40 else "" to 0
-                }
+        val repCache = HashMap<String, WordEntry?>()
+        fun representative(syllable: String, start: Int, end: Int): WordEntry? =
+            repCache.getOrPut("$syllable@$start") {
+                database.queryExact(digits.substring(start, end), 40)
+                    .firstOrNull { it.pinyin.replace("'", "") == syllable }
             }
 
         val score = HashMap<String, Int>(splits.size)
@@ -351,23 +332,21 @@ class PinyinEngine(private val database: DictionaryDatabase) {
             var pos = 0
             val reps = StringBuilder()
             for (syl in reading.split(' ')) {
-                val (w, f) = representative(syl, pos, pos + syl.length)
-                total += f
+                val rep = representative(syl, pos, pos + syl.length)
+                total += rep?.score ?: SELECTOR_NO_REP_PENALTY
                 if (reps.isNotEmpty()) reps.append(' ')
-                reps.append(w)
+                reps.append(rep?.word ?: syl)
                 pos += syl.length
             }
-            // 整读法成词加成（双倍权重，拼音精确匹配）：读法本身就是词库词条时（如 chao ji = 超级），
-            // 加该词词频×2——真词读法必须显著压过“只代表字频高”的拼字读法。
-            // 必须精确匹配：前缀 GLOB 会误命中更长词（biao'ji* → 表姐 biao'jie），
-            // 把非词读法顶到第一，导致 242654 默认 biao ji 而 超级 被压到第二读法
-            val fullWord = database.queryTopWordByPinyinExact(reading.replace(" ", "'"))
-            if (fullWord != null) total += fullWord.second * 2
+            // 整读法成词加成：读法本身就是词库词条时（如 chao ji = 超级）给固定奖励，
+            // 真词读法必须显著压过"只靠代表字分高"的拼字读法
+            if (database.topWordByPinyinExact(reading.replace(" ", "'")) != null) {
+                total += SELECTOR_WHOLE_WORD_BONUS
+            }
             score[reading] = total
             repText[reading] = reps.toString()
         }
 
-        // 音节数升序 -> 代表字/词词频降序 -> 代表文本字典序（排序稳定）
         return splits.sortedWith(
             compareBy({ it.count { c -> c == ' ' } }, { -(score[it] ?: 0) }, { repText[it] ?: "" })
         )
@@ -381,13 +360,11 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         dp[0].add("")
 
         for (i in 1..n) {
-            // 长段优先生成：完整音节（如 che）先于垃圾组合（如 ai+e）占用封顶名额，
-            // 否则正确读法会被短段组合挤出（如 243884 丢失 che tui）
+            // 长段优先生成：完整音节（如 che）先于垃圾组合（如 ai+e）占用封顶名额
             for (j in maxOf(0, i - MAX_PINYIN_LEN) until i) {
                 if (dp[j].isEmpty()) continue
                 val matches = segmentPinyins(digits.substring(j, i))
                 if (matches.isEmpty()) continue
-
                 for (prefix in dp[j]) {
                     for (py in matches) {
                         if (dp[i].size >= MAX_DISPLAY_SPLITS) break
@@ -397,7 +374,6 @@ class PinyinEngine(private val database: DictionaryDatabase) {
                 }
             }
         }
-
         return dp[n]
     }
 
@@ -413,65 +389,64 @@ class PinyinEngine(private val database: DictionaryDatabase) {
     }
 
     /**
-     * 联想候选（模拟主流输入法上屏后的下文推荐）：
-     * 返回词库中以已上屏词为前缀的更长词条（如 中国 -> 中国人/中国梦）。
-     * 无语言模型下的实用近似：16 万词组中同前缀长词覆盖常见搭配。
+     * 联想候选：返回词库中以已上屏词为前缀的更长词条（如 中国 -> 中国人/中国梦）。
+     * 无语言模型下的实用近似；真正的上下文预测留给 bigram 阶段。
      */
     fun associate(base: String): List<Candidate> {
         if (base.isEmpty() || !database.isReady) return emptyList()
-        if (!base.any { it in '\u4E00'..'\u9FFF' }) return emptyList()
+        if (base.none { it in '\u4E00'..'\u9FFF' }) return emptyList()
         return database.queryWordsByPrefix(base, 30)
-            .filter { (word, _, _) ->
-                word.any { it in '\u4E00'..'\u9FFF' } && word.length <= base.length + 4
-            }
-            .map { (word, pinyin, freq) -> Candidate(word, freq, pinyin) }
+            .filter { it.word.length <= base.length + 4 }
+            .map { Candidate(it.word, it.score, it.pinyin) }
             .take(20)
     }
 
     fun inputFullPinyin(pinyin: String): List<Candidate> {
-        if (pinyin.isEmpty()) return emptyList()
-
-        return database.queryWords(pinyin.lowercase(), 20)
-            .map { Candidate(it.first, it.second) }
+        if (pinyin.isEmpty() || !database.isReady) return emptyList()
+        val key = pinyin.lowercase()
+        return database.queryPrefix(DictionaryDatabase.toDigits(key), 60)
+            .filter { it.pinyin.replace("'", "").startsWith(key) }
+            .map { Candidate(it.word, it.score, it.pinyin) }
+            .take(20)
     }
 
     /** 拼音 → T9 数字序列 */
     fun pinyinToDigits(pinyin: String): String = DictionaryDatabase.toDigits(pinyin)
 
-    /** 用户选词后提升词频：拼音+词条共同定位（只按拼音会误抬同音词） */
-    fun incrementFrequency(pinyin: String, word: String) {
-        database.incrementFrequency(pinyin, word)
+    /** 用户选词学习：记一次（带衰减的）偏好。旧版按拼音更新会连带宠坏同音词 */
+    fun learnSelection(pinyin: String, word: String) {
+        database.bumpPreference(pinyin, word)
     }
 
-    fun addWord(pinyin: String, word: String) {
-        database.insertWord(pinyin, word)
-    }
-
-    /** 学习用户组合新词（整句上屏时自动调用），下次直接作为词条命中 */
-    fun learnPhrase(pinyin: String, word: String) {
-        database.learnPhrase(pinyin, word)
-    }
-
-    /**
-     * 连续上屏组词学习：用户逐字/逐词连续上屏时拼出的新词入库（如 张→三 学会 张三）。
-     * 起始词频取 USER_COMPOSE_FREQ：高于资产词组平档 50（能进候选），
-     * 低于单字 85/常用词 88（不抢位）；再次选中时常规学习升入用户保护档 95。
-     */
-    fun learnUserWord(pinyin: String, word: String) {
-        database.learnUserWord(pinyin, word, USER_COMPOSE_FREQ)
+    /** 用户主动加词 / 整句组合学出的新词：入用户词库，不衰减 */
+    fun addUserWord(pinyin: String, word: String) {
+        database.addUserWord(pinyin, word)
     }
 
     companion object {
-        // 覆盖率实测：20 条时 23.8% 词条不可达，60 条时仅 4.5%（超大同音组尾部）
         private const val CANDIDATE_LIMIT = 60
-
-        /** 连续上屏组词的起始学习词频 */
-        private const val USER_COMPOSE_FREQ = 60
+        private const val PREFIX_EXACT_LIMIT = 16
+        private const val CONTINUE_LIMIT = 96
 
         /** 拼音最长字母数（zhuang/chuang = 6） */
         private const val MAX_PINYIN_LEN = 6
 
-        /** 拼音回显每个位置保留的分段数上限：太小会让正确读法被剪掉（如 che tui），16 兼顾质量与开销 */
+        /** 整句 DP：每个位置保留的路径数上限 */
+        private const val K = 3
+
+        /** 整句 DP：单词数字长上限（涵盖绝大多数 2-4 字词） */
+        private const val MAX_WORD_DIGITS = 8
+
+        /** 整句 DP：每个子串取的词条数上限 */
+        private const val WORDS_PER_SUB = 6
+
+        /** 拼音回显每个位置保留的分段数上限 */
         private const val MAX_DISPLAY_SPLITS = 16
+
+        /** 读法代表字缺失时的惩罚分（毫纳特），保证无候选的读法排到最后 */
+        private const val SELECTOR_NO_REP_PENALTY = -30000
+
+        /** 读法本身是词库词条时的加法奖励（毫纳特，约 8 纳特 ≈ 3000 倍偏好） */
+        private const val SELECTOR_WHOLE_WORD_BONUS = 8000
     }
 }

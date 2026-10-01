@@ -60,7 +60,8 @@ jobs:
             自动构建（提交 ${{ github.sha }}）
 
             下载 PersonalIME-release.apk 安装。
-            注意：首次启动需导入词库（40 万条），候选栏显示“词库加载中…”属正常现象。
+            首次启动会把内置词库（约 25 MB、38.7 万条）解压到应用私有目录，属一次性动作；
+            在此之前候选栏会显示“词库加载中…”，完成后即可正常输入。
           files: |
             PersonalIME/PersonalIME/app/build/outputs/apk/release/*.apk
             PersonalIME/PersonalIME/app/build/outputs/apk/debug/*.apk

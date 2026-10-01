@@ -2,40 +2,364 @@ package com.personal.ime.data
 
 import android.content.ContentValues
 import android.content.Context
+import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
+import android.database.sqlite.SQLiteException
 import android.database.sqlite.SQLiteOpenHelper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlin.math.ln
+import kotlin.math.pow
 
+/**
+ * 词库数据层（v1，用户库 `ime_user.db` + 挂载只读基础库 `base_words.db`）
+ *
+ * ## 相对旧版的结构性变化
+ *
+ * 旧版把两件语义完全不同的事压进同一个 `words.frequency` 整数：
+ *   ①「这个词在汉语里有多常用」——语言先验，只读，随词库更新
+ *   ②「这个用户有多喜欢它」——个人偏好，可写，会衰减
+ * 后果：15 个魔法档位常量互相竞争、5 张补丁表越加越多、升级迁移越来越复杂、
+ * 用户数据无法独立重置、词库无法独立更新。
+ *
+ * 新版拆成三张表：
+ *   base_words（在 base_words.db，只读，随包分发）—— 连续 logp
+ *   user_words（本文件，可写）—— 用户主动添加，**不衰减**
+ *   user_pref （本文件，可写）—— 系统学出的偏好，**指数衰减**
+ *
+ * ## 分数单位
+ * 所有分数统一为 **毫纳特（natural log × 1000）的整数**，越大越优。
+ * 基础词 logp 范围约 -26000 ~ -3000（离线流水线产出）。
+ * 用户偏好通过 [PREF_DOMINANCE] 直接压过基础档，而不是去调一个"不撞档的魔数"。
+ *
+ * ## 为什么不用 WAL
+ * ATTACH 是**连接级**状态，而启用 WAL 会让 Android 使用连接池，
+ * 池中其它连接看不到 `base` 别名，查询会报 `no such table: base.base_words`。
+ * 未启用 WAL 时连接池大小为 1，ATTACH 安全。用户库写入量极小（每次上屏一条 upsert），
+ * 不需要 WAL 的并发能力。
+ */
 class DictionaryDatabase(private val appContext: Context) :
-    SQLiteOpenHelper(appContext, "dictionary.db", null, 16) {
+    SQLiteOpenHelper(appContext, DB_NAME, null, DB_VERSION) {
 
-    /** 词频学习等写操作放到 IO 线程，避免主线程卡顿（用户上屏每个词都会触发） */
     private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val baseDictionary = BaseDictionary(appContext)
 
-    /** 词库是否已完成首次建库导入（未就绪时在 Service 展示提示，避免主线程阻塞） */
     @Volatile
     private var ready = false
 
-    val isReady: Boolean
-        get() = ready
+    /** base 别名是否已挂到当前连接上 */
+    @Volatile
+    private var attached = false
+
+    val isReady: Boolean get() = ready
 
     override fun onConfigure(db: SQLiteDatabase) {
         super.onConfigure(db)
-        // WAL：首次建库导入 40 万条词条期间，读请求不被写事务阻塞。
-        // 注意 setWriteAheadLoggingEnabled 是隐藏 API，公开 API 只有已废弃的 enableWriteAheadLogging
-        @Suppress("DEPRECATION")
-        db.enableWriteAheadLogging()
+        // 刻意不调用 enableWriteAheadLogging()，原因见类注释（ATTACH 与连接池互斥）
+        attached = false
     }
 
+    override fun onCreate(db: SQLiteDatabase) {
+        // 用户主动添加的词：优先级极高、持久、不随时间衰减
+        db.execSQL("""
+            CREATE TABLE $TABLE_USER_WORDS (
+                pinyin TEXT NOT NULL,
+                word   TEXT NOT NULL,
+                digits TEXT NOT NULL,
+                logp   INTEGER NOT NULL,
+                added_at INTEGER NOT NULL,
+                PRIMARY KEY (digits, word)
+            )
+        """)
+        db.execSQL("CREATE INDEX idx_user_words_word ON $TABLE_USER_WORDS($COL_WORD)")
+
+        // 系统学出的偏好：带时间戳，读取时按 Δt 指数衰减
+        db.execSQL("""
+            CREATE TABLE $TABLE_USER_PREF (
+                scope  TEXT NOT NULL,
+                key    TEXT NOT NULL,
+                digits TEXT NOT NULL,
+                cnt    INTEGER NOT NULL,
+                t_last INTEGER NOT NULL,
+                PRIMARY KEY (scope, key, digits)
+            )
+        """)
+        db.execSQL("CREATE INDEX idx_user_pref_digits ON $TABLE_USER_PREF(digits)")
+    }
+
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        // v1 为初版。基础词库与用户库已分离，词库升级不再需要动用户数据，
+        // 因此这里是空的——旧版那 8 段 "if (oldVersion < N)" 迁移链随之消失。
+    }
+
+    /**
+     * 后台预热：安装基础词库（首次约 25 MB 拷贝）+ 挂载。
+     * 不在这里做任何数据导入——词库是离线构建好的成品文件。
+     */
+    fun warmUp() {
+        try {
+            if (!baseDictionary.ensureInstalled()) {
+                ready = false
+                return
+            }
+            attachIfNeeded(writableDatabase)
+            ready = true
+        } catch (e: Exception) {
+            ready = false
+        }
+    }
+
+    private fun attachIfNeeded(db: SQLiteDatabase) {
+        if (attached) return
+        try {
+            baseDictionary.attach(db)
+        } catch (e: SQLiteException) {
+            // 已挂载（重复 ATTACH 会抛错）——视为成功
+        }
+        attached = true
+    }
+
+    /** 统一的取库入口：保证 base 已挂载 */
+    private fun db(): SQLiteDatabase {
+        val database = writableDatabase
+        attachIfNeeded(database)
+        return database
+    }
+
+    // ──────────────────────────────────────────────────────────── 查询
+
+    /** 数字序列精确匹配（恰好打完） */
+    fun queryExact(digits: String, limit: Int): List<WordEntry> =
+        query("$COL_DIGITS = ?", arrayOf(digits), digits, limit)
+
+    /** 数字序列前缀匹配（续打：输入 64426 也能命中更长的词） */
+    fun queryPrefix(digits: String, limit: Int): List<WordEntry> =
+        query("$COL_DIGITS GLOB ?", arrayOf(digits + "*"), digits, limit)
+
+    /**
+     * 精确匹配 + 拼音前缀过滤（用户在拼音选择列点了某个读法）。
+     * 拼音过滤在内存里做：数字组通常只有几十条，不值当为它单独建索引
+     * （旧版有一个 (pinyin, freq) 索引，为省约 10 MB 已去掉）。
+     */
+    fun queryExactAndPinyin(digits: String, pinyinPrefix: String, limit: Int): List<WordEntry> =
+        query("$COL_DIGITS = ?", arrayOf(digits), digits, limit * 3)
+            .filter { it.pinyin.replace("'", "").startsWith(pinyinPrefix) }
+            .take(limit)
+
+    /** 联想：以已上屏词为前缀的更长词条（走 base 的 word 索引） */
+    fun queryWordsByPrefix(prefix: String, limit: Int): List<WordEntry> {
+        val out = ArrayList<WordEntry>(limit)
+        val sql = """
+            SELECT $COL_WORD, $COL_PINYIN, $COL_LOGP, $COL_FLAGS FROM ${BaseDictionary.ALIAS}.${BaseDictionary.TABLE}
+            WHERE $COL_WORD GLOB ? AND $COL_WORD != ?
+            ORDER BY $COL_LOGP DESC LIMIT ?
+        """
+        db().rawQuery(sql, arrayOf(prefix + "*", prefix, limit.toString())).use { c ->
+            while (c.moveToNext()) out.add(c.toEntry())
+        }
+        mergeUserWords(out, prefix)
+        return out.sortedByDescending { it.score }.take(limit)
+    }
+
+    /**
+     * 英文预测：以 prefix 开头的用户词条，返回 (词, 权重)。
+     *
+     * 基础词库不含拉丁词条（离线流水线只收中文），所以英文候选只来自用户学习
+     * （[learnEnglishWord] 写入 user_words）。权重用"越近上屏越靠前"的序号，
+     * 因为 user_words 是 REPLACE 语义、不累计次数——最近用过的排前面即可。
+     */
+    fun queryWords(prefix: String, limit: Int): List<Pair<String, Int>> {
+        val out = ArrayList<Pair<String, Int>>(limit)
+        db().rawQuery(
+            "SELECT $COL_WORD FROM $TABLE_USER_WORDS " +
+                "WHERE $COL_WORD GLOB ? AND $COL_WORD GLOB '[a-zA-Z]*' " +
+                "ORDER BY $COL_ADDED_AT DESC LIMIT ?",
+            arrayOf(prefix.lowercase() + "*", limit.toString())
+        ).use { c ->
+            var rank = 0
+            while (c.moveToNext()) {
+                out.add(c.getString(0) to (limit - rank).coerceAtLeast(1))
+                rank++
+            }
+        }
+        return out
+    }
+
+    /**
+     * 拼音精确匹配的最高分词条（拼音选择器做"读法成词"加成用）。
+     * 走 digits 主键 + 内存过滤拼音，不需要 pinyin 索引。
+     */
+    fun topWordByPinyinExact(pinyin: String): WordEntry? {
+        val digits = toDigits(pinyin)
+        return queryExact(digits, 60).firstOrNull { it.pinyin == pinyin }
+    }
+
+    private fun query(where: String, args: Array<String>, digits: String, limit: Int): List<WordEntry> {
+        val out = ArrayList<WordEntry>(limit)
+        val sql = """
+            SELECT $COL_WORD, $COL_PINYIN, $COL_LOGP, $COL_FLAGS
+            FROM ${BaseDictionary.ALIAS}.${BaseDictionary.TABLE}
+            WHERE $where ORDER BY $COL_LOGP DESC LIMIT ?
+        """
+        db().rawQuery(sql, args + limit.toString()).use { c ->
+            while (c.moveToNext()) out.add(c.toEntry())
+        }
+        mergeUserWords(out, digits)
+        return out.sortedByDescending { it.score }.take(limit)
+    }
+
+    /**
+     * 合并用户数据：用户添加的词条 + 用户偏好加成。
+     * 必须在内存里做——若把 user_pref 写进 SQL 的 ORDER BY，
+     * 低分但被用户偏好的词会在 LIMIT 之前就被截掉，偏好永远不生效。
+     */
+    private fun mergeUserWords(out: MutableList<WordEntry>, digitsPattern: String) {
+        val database = db()
+        val now = System.currentTimeMillis() / 1000L
+
+        // 1) 用户主动添加的词：不衰减，直接给高分
+        val likeArg = if (digitsPattern.endsWith("*")) digitsPattern else "$digitsPattern*"
+        val fromUser = ArrayList<WordEntry>()
+        database.rawQuery(
+            "SELECT $COL_WORD, $COL_PINYIN, $COL_LOGP, $COL_DIGITS FROM $TABLE_USER_WORDS WHERE $COL_DIGITS GLOB ?",
+            arrayOf(likeArg)
+        ).use { c ->
+            while (c.moveToNext()) {
+                if (c.getString(3).startsWith(digitsPattern)) {
+                    fromUser.add(WordEntry(c.getString(0), c.getString(1), c.getInt(2), 0))
+                }
+            }
+        }
+        // 2) 用户偏好：按 Δt 指数衰减后转成压制性加成
+        val prefBonus = HashMap<String, Int>()
+        database.rawQuery(
+            "SELECT key, cnt, t_last FROM $TABLE_USER_PREF WHERE scope = ? AND $COL_DIGITS GLOB ?",
+            arrayOf(SCOPE_WORD, likeArg)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val weight = preferenceWeight(c.getLong(1), c.getLong(2), now)
+                if (weight >= PREF_MIN_WEIGHT) {
+                    prefBonus[c.getString(0)] = PREF_DOMINANCE
+                }
+            }
+        }
+
+        if (fromUser.isEmpty() && prefBonus.isEmpty()) return
+
+        val byWord = HashMap<String, WordEntry>()
+        for (e in out) byWord[e.word] = e
+        for (e in fromUser) {
+            val prev = byWord[e.word]
+            if (prev == null || e.score > prev.score) byWord[e.word] = e
+        }
+        out.clear()
+        out.addAll(byWord.values.map { e ->
+            val bonus = prefBonus[e.word] ?: 0
+            if (bonus == 0) e else e.copy(score = e.score + bonus)
+        })
+    }
+
+    /**
+     * 偏好权重（纳特）：`ln(1+cnt) · 2^(-Δt/半衰期)`
+     * - `ln(1+cnt)` 让"反复选择"比"偶尔误选"更稳
+     * - 指数项让旧习惯自然退场：半衰期 7 天，约 3 周后低于阈值自动失宠
+     */
+    private fun preferenceWeight(cnt: Long, tLast: Long, now: Long): Double {
+        if (cnt <= 0) return 0.0
+        val deltaDays = ((now - tLast).coerceAtLeast(0L)) / 86400.0
+        return ln(1.0 + cnt) * 0.5.pow(deltaDays / PREF_HALF_LIFE_DAYS)
+    }
+
+    // ──────────────────────────────────────────────────────────── 学习
+
+    /**
+     * 用户选中某词：记一次偏好（衰减型）。
+     * 只按 (word, digits) 记账，不再"按拼音更新"——旧版按拼音更新会把用户
+     * 没选中的同音词一起顶上去（选了「你好」却把「昵好」宠坏）。
+     */
+    fun bumpPreference(pinyin: String, word: String) {
+        val digits = toDigits(pinyin)
+        ioScope.launch {
+            val now = System.currentTimeMillis() / 1000L
+            db().execSQL(
+                "INSERT INTO $TABLE_USER_PREF(scope, key, digits, cnt, t_last) VALUES(?,?,?,1,?) " +
+                    "ON CONFLICT(scope, key, digits) DO UPDATE SET cnt = cnt + 1, t_last = ?",
+                arrayOf(SCOPE_WORD, word, digits, now, now)
+            )
+        }
+    }
+
+    /**
+     * 用户主动添加的词（或整句上屏时学出的组合词）：
+     * 写入 user_words，优先级高且**不衰减**——与"系统学出的偏好"是两种东西。
+     */
+    fun addUserWord(pinyin: String, word: String) {
+        val pinyinKey = pinyin.lowercase()
+        val digits = toDigits(pinyinKey)
+        ioScope.launch {
+            val values = ContentValues().apply {
+                put(COL_PINYIN, pinyinKey)
+                put(COL_WORD, word)
+                put(COL_DIGITS, digits)
+                put(COL_LOGP, USER_WORD_LOGP)
+                put(COL_ADDED_AT, System.currentTimeMillis() / 1000L)
+            }
+            db().insertWithOnConflict(TABLE_USER_WORDS, null, values, SQLiteDatabase.CONFLICT_REPLACE)
+        }
+    }
+
+    /** 学习英文单词：仅接受纯拉丁字母（用户库新增条目） */
+    fun learnEnglishWord(word: String) {
+        val lower = word.lowercase()
+        if (lower.isEmpty() || !lower.all { it in 'a'..'z' }) return
+        addUserWord(lower, word)
+    }
+
+    /** 清空全部用户数据（不影响基础词库）——旧版只能靠"清除应用数据"才能做到 */
+    fun resetUserData() {
+        ioScope.launch {
+            val database = db()
+            database.execSQL("DELETE FROM $TABLE_USER_WORDS")
+            database.execSQL("DELETE FROM $TABLE_USER_PREF")
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────── 工具
+
+    private fun Cursor.toEntry() = WordEntry(getString(0), getString(1), getInt(2), getInt(3))
+
     companion object {
-        private const val TABLE_WORDS = "words"
+        private const val DB_NAME = "ime_user.db"
+        private const val DB_VERSION = 1
+
+        private const val TABLE_USER_WORDS = "user_words"
+        private const val TABLE_USER_PREF = "user_pref"
         private const val COL_PINYIN = "pinyin"
         private const val COL_WORD = "word"
-        private const val COL_FREQ = "frequency"
         private const val COL_DIGITS = "digits"
+        private const val COL_LOGP = "logp"
+        private const val COL_FLAGS = "flags"
+        private const val COL_ADDED_AT = "added_at"
+
+        private const val SCOPE_WORD = "word"
+
+        /** 用户添加词的初始 logp：高于绝大多数基础词，保证立即可见 */
+        private const val USER_WORD_LOGP = -2000
+
+        /**
+         * 偏好压制加成（毫纳特）。基础词 logp 范围约 -26000 ~ -3000，
+         * 取 40000 保证被偏好的词**一定**压过任何基础词，无需去猜同音组里的最大分。
+         * 这是"随使用越来越懂你"的实现方式，而衰减负责让它自然退场。
+         */
+        private const val PREF_DOMINANCE = 40000
+
+        /** 偏好权重阈值（纳特）：低于此值视为已遗忘 */
+        private const val PREF_MIN_WEIGHT = 0.15
+
+        /** 偏好半衰期（天）：约 3 周后一次误选自然失宠 */
+        private const val PREF_HALF_LIFE_DAYS = 7.0
 
         /** 拼音字母 → T9 数字（v 是 ü 的键入形式，与 u 同键） */
         private val LETTER_TO_DIGIT = mapOf(
@@ -49,1313 +373,21 @@ class DictionaryDatabase(private val appContext: Context) :
             'w' to '9', 'x' to '9', 'y' to '9', 'z' to '9'
         )
 
-        /** 拼音/英文单词 → T9 数字序列（忽略音节分隔符 '） */
+        /** 拼音/英文单词 → T9 数字序列（忽略音节分隔符） */
         fun toDigits(text: String): String =
             text.lowercase().filter { it != '\'' }
                 .map { LETTER_TO_DIGIT[it] ?: it }.joinToString("")
-
-        /** 单字词库资产文件（《通用规范汉字表》8105 字） */
-        private const val ASSET_CN_CHARS = "cn_chars.txt"
-
-        /** 词语/成字词库资产文件（汉典成语 + 2-4 字词组，约 16 万条） */
-        private const val ASSET_CN_WORDS = "cn_words.txt"
-        
-        /** 常用词升档表（拼音 词）：词组资产词频平坦（46-50），同音组内排序退化为入库序，
-         *  生僻词会排在常用词前面（如 儆鉴 先于 精简）；此表把精选常用词升到 COMMON_TIER */
-        private const val ASSET_COMMON_BOOST = "common_boost.txt"
-
-        /** 常用单字升档表（字 词频）：单字五档制（55~85）区分度不足，超高频字（要/秒/及）
-         *  在同音组被一堆同档字排后；按使用频率赋 91~94 修正 */
-        private const val ASSET_CHAR_BOOST = "char_boost.txt"
-
-        /** 多音字补丁表（拼音 字）：单字资产多数只收一个读音（如 行 只有 xing），
-         *  补入常用缺失读音（hang 行 等），否则用户打另一读音永远出不来该字 */
-        private const val ASSET_MULTI_PRON = "multi_pron.txt"
-
-        /**
-         * 口语高频词升档表（拼音 词）。
-         * 背景：《现代汉语常用词表》偏书面语/百科，对口语、问候、应答结构收录严重缺失——
-         * 实测「你好/您好/不对/是的/做什么/干什么/什么时候」等全部落空，只能拿到资产平档 50。
-         * 而九键 T9 把 n/m、l/r 并键，「你好」(64426) 与「密函/密告/拟稿/米糕/蜜柑」(同数字)
-         * 完全同键，后者只要被词表收录就拿到 62 档，把「你好」压到候选栏第 6 位。
-         * 这类词靠"补录词表"永远补不完（未收录率 86%），故单开一个口语档兜底。
-         */
-        private const val ASSET_ORAL_BOOST = "oral_boost.txt"
-
-        /** 真实词频分级表（词 频级名次）：来自《现代汉语常用词表》5.6 万词（2.5 亿字语料），
-         *  名次越小越常用。词组资产平档 50 无区分度，同音组内排序退化为拼音字母序，
-         *  生僻词（俵寄/猋急）排在常用词前——按频级分档注入真实常用度 */
-        private const val ASSET_WORD_FREQ = "word_freq.txt"
-
-        /** 用户词保护档：用户打过的词直接跳入此档，压过所有基础档位（手编词 90/单字 85/词组 50），
-         *  之后再打则在档内 +1，几次即可稳定置顶 */
-        private const val USER_TIER = 95
-
-        /** 口语高频词档：问候/应答/口头结构，高于词频分级最高档 89，低于用户保护档 95。
-         *  必须压过词频分级的头部档（89），否则「你好」这类词仍会被同键生僻词顶下去 */
-        private const val ORAL_TIER = 92
-
-        /** 常用词档：精选高频词（如 精简/时间）升至此档，高于资产词组平档 50、低于手编词 90 */
-        private const val COMMON_TIER = 88
-
-        /** 多音字补丁读音档：补入的次常用读音置于此档，能进同音组前列但不压过主读音 */
-        private const val MULTI_PRON_TIER = 88
-    }
-
-    override fun onCreate(db: SQLiteDatabase) {
-        db.execSQL("""
-            CREATE TABLE $TABLE_WORDS (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                $COL_PINYIN TEXT NOT NULL,
-                $COL_WORD TEXT NOT NULL,
-                $COL_FREQ INTEGER DEFAULT 1,
-                $COL_DIGITS TEXT NOT NULL DEFAULT '',
-                UNIQUE($COL_PINYIN, $COL_WORD)
-            )
-        """)
-        // 复合索引：digits/pinyin 前缀匹配 + frequency 降序可全程走索引，免临时排序
-        // （单列 digits 索引由本复合索引前缀覆盖，不再单独建）
-        db.execSQL("CREATE INDEX idx_words_digits_freq ON $TABLE_WORDS($COL_DIGITS, $COL_FREQ DESC)")
-        db.execSQL("CREATE INDEX idx_words_pinyin_freq ON $TABLE_WORDS($COL_PINYIN, $COL_FREQ DESC)")
-        // word 单列索引：词频学习按 word 更新，无此索引会全表扫描 40 万行卡死主线程
-        db.execSQL("CREATE INDEX idx_words_word ON $TABLE_WORDS($COL_WORD)")
-
-        // Insert built-in tech terms
-        insertTechTerms(db)
-
-        // Insert 高频动宾短语种子（词组资产缺失的日常刚需词，如 给我）
-        insertPhraseSeeds(db)
-
-        // Insert 《通用规范汉字表》单字（覆盖新华字典全部汉字）
-        loadAssetWords(db, ASSET_CN_CHARS)
-
-        // Insert 词语/成字词库（汉典成语 + 2-4 字词组）
-        loadAssetWords(db, ASSET_CN_WORDS)
-
-        // 真实词频分级：按《现代汉语常用词表》频级名次分档，治本解决同音组生僻词排前
-        applyWordFreqTiers(db)
-
-        // 常用词升档：精选表的补充（科技/办公词可能不在 5.6 万词表内）
-        boostCommonWords(db)
-
-        // 常用单字升档：纠正五档制档位失真（如 要 在自己组排第 14）
-        boostCommonChars(db)
-
-        // 口语高频词兜底升档：必须在词频分级之后，补上词表漏收的问候/应答结构
-        applyOralBoost(db)
-
-        // 重复词条归一：手编连写拼音与资产分隔拼音同词并存 -> 合并为分隔拼音单条
-        normalizeWordDuplicates(db)
-
-        // 多音字补丁：补入单字资产缺失的常用读音（如 hang 行）
-        insertMultiPron(db)
-    }
-
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        if (oldVersion >= 8) {
-            // 8→9：仅补 word 列索引（词频学习按 word 更新），保留已导入词库，
-            // 避免 DROP 重建导致重新导入 40 万条（加载慢）
-            if (oldVersion < 9) {
-                db.execSQL("CREATE INDEX IF NOT EXISTS idx_words_word ON $TABLE_WORDS($COL_WORD)")
-            }
-            // 9→10：补录高频短语种子（存量词库不重建，仅追加新词条）
-            if (oldVersion < 10) {
-                insertPhraseSeeds(db)
-            }
-            // 10→11：常用词升档（同音组乱序修复，存量用户无需重装）
-            if (oldVersion < 11) {
-                boostCommonWords(db)
-            }
-            // 11→12：常用单字升档 + 重复词条归一（先升档后归一，归一保留最高词频）
-            if (oldVersion < 12) {
-                boostCommonChars(db)
-                normalizeWordDuplicates(db)
-            }
-            // 12→13：多音字补丁 + 补录 V+起来 短语种子（insertPhraseSeeds 幂等，
-            // 已存在的种子遇 UNIQUE 冲突静默跳过）
-            if (oldVersion < 13) {
-                insertMultiPron(db)
-                insertPhraseSeeds(db)
-            }
-            // 13→14：升档资产扩充（超级/知道/非常 等 + 超 字）。
-            // 升档操作全部幂等且仅升不降，存量用户重跑一遍即可拿到新增条目，
-            // 否则一次性门控（<11）会让已升级用户永远缺失后续扩充的词
-            if (oldVersion < 14) {
-                boostCommonWords(db)
-                boostCommonChars(db)
-                insertMultiPron(db)
-                insertPhraseSeeds(db)
-            }
-            // 14→15：注入真实词频分级（5.6 万词按《现代汉语常用词表》频级分档）
-            if (oldVersion < 15) {
-                applyWordFreqTiers(db)
-            }
-            // 15→16：口语高频词升档（修复「你好」被同键生僻词压到候选栏第 6 位）
-            // + 重跑词频分级（tierForRank 由 5 档细化到 8 档，存量用户需要重新分档才能拿到分辨率）。
-            // 两步均幂等且仅升不降，重跑安全
-            if (oldVersion < 16) {
-                applyWordFreqTiers(db)
-                applyOralBoost(db)
-            }
-        } else {
-            db.execSQL("DROP TABLE IF EXISTS $TABLE_WORDS")
-            onCreate(db)
-        }
-    }
-
-    /**
-     * 高频动宾短语种子：词组资产没有但日常必打（如 给我），且整句组合易被单字词组挤掉。
-     * 独立于 commonWords，便于升级路径对存量词库补录（db.insert 遇 UNIQUE 冲突返回 -1，静默跳过）
-     */
-    private fun insertPhraseSeeds(db: SQLiteDatabase) {
-        // 拼音用音节分隔符格式（与资产词条一致），保证与 learnPhrase 入库格式同构、读法成词加成可命中；
-        // V+起来 为日常高频口语组合（词组资产缺失），入种子后精确命中置顶，
-        // 且续打阶段可被前缀查询带出（如打 966474 已可见 用起来）
-        val phrases = mapOf(
-            "gei'wo" to "给我",
-            "gei'ni" to "给你",
-            "gei'ta" to "给他",
-            "gei'ta'men" to "给他们",
-            "gei'wo'men" to "给我们",
-            "yong'qi'lai" to "用起来",
-            "kan'qi'lai" to "看起来",
-            "ting'qi'lai" to "听起来",
-            "shuo'qi'lai" to "说起来",
-            "zuo'qi'lai" to "做起来",
-            "xiang'qi'lai" to "想起来",
-            "zhan'qi'lai" to "站起来",
-            "na'qi'lai" to "拿出来",
-            "chi'qi'lai" to "吃起来",
-            "he'qi'lai" to "喝起来",
-            "xie'qi'lai" to "写起来",
-            "du'qi'lai" to "读起来",
-            "gan'qi'lai" to "干起来",
-            "pao'qi'lai" to "跑起来",
-            "xiao'qi'lai" to "笑起来"
-        )
-        phrases.forEach { (pinyin, word) ->
-            val values = ContentValues().apply {
-                put(COL_PINYIN, pinyin)
-                put(COL_WORD, word)
-                put(COL_FREQ, 90)
-                put(COL_DIGITS, toDigits(pinyin))
-            }
-            db.insert(TABLE_WORDS, null, values)
-        }
-    }
-
-    private fun insertTechTerms(db: SQLiteDatabase) {
-        val techTerms = mapOf(
-            "python" to "Python",
-            "api" to "API",
-            "sdk" to "SDK",
-            "http" to "HTTP",
-            "docker" to "Docker",
-            "git" to "Git",
-            "java" to "Java",
-            "kotlin" to "Kotlin",
-            "javascript" to "JavaScript",
-            "typescript" to "TypeScript",
-            "react" to "React",
-            "vue" to "Vue",
-            "angular" to "Angular",
-            "nodejs" to "Node.js",
-            "npm" to "npm",
-            "yarn" to "yarn",
-            "webpack" to "Webpack",
-            "linux" to "Linux",
-            "windows" to "Windows",
-            "macos" to "macOS",
-            "ios" to "iOS",
-            "android" to "Android",
-            "sql" to "SQL",
-            "nosql" to "NoSQL",
-            "mongodb" to "MongoDB",
-            "mysql" to "MySQL",
-            "postgresql" to "PostgreSQL",
-            "redis" to "Redis",
-            "aws" to "AWS",
-            "azure" to "Azure",
-            "gcp" to "GCP",
-            "kubernetes" to "Kubernetes",
-            "k8s" to "k8s",
-            "devops" to "DevOps",
-            "ci" to "CI",
-            "cd" to "CD",
-            "json" to "JSON",
-            "xml" to "XML",
-            "yaml" to "YAML",
-            "html" to "HTML",
-            "css" to "CSS",
-            "sass" to "Sass",
-            "less" to "Less",
-            "bootstrap" to "Bootstrap",
-            "tailwind" to "Tailwind",
-            "flutter" to "Flutter",
-            "dart" to "Dart",
-            "swift" to "Swift",
-            "rust" to "Rust",
-            "golang" to "Golang",
-            "php" to "PHP",
-            "ruby" to "Ruby",
-            "rails" to "Rails",
-            "django" to "Django",
-            "flask" to "Flask",
-            "spring" to "Spring",
-            "hibernate" to "Hibernate",
-            "tensorflow" to "TensorFlow",
-            "pytorch" to "PyTorch",
-            "keras" to "Keras",
-            "numpy" to "NumPy",
-            "pandas" to "Pandas",
-            "scipy" to "SciPy",
-            "matplotlib" to "Matplotlib",
-            "jupyter" to "Jupyter",
-            "vscode" to "VSCode",
-            "intellij" to "IntelliJ",
-            "eclipse" to "Eclipse",
-            "androidstudio" to "Android Studio",
-            "xcode" to "Xcode",
-            "github" to "GitHub",
-            "gitlab" to "GitLab",
-            "bitbucket" to "Bitbucket",
-            "stackoverflow" to "StackOverflow",
-            "dockerhub" to "DockerHub",
-            "nginx" to "Nginx",
-            "apache" to "Apache",
-            "tomcat" to "Tomcat",
-            "graphql" to "GraphQL",
-            "rest" to "REST",
-            "grpc" to "gRPC",
-            "websocket" to "WebSocket",
-            "jwt" to "JWT",
-            "oauth" to "OAuth",
-            "ssl" to "SSL",
-            "tls" to "TLS",
-            "https" to "HTTPS",
-            "tcp" to "TCP",
-            "udp" to "UDP",
-            "ip" to "IP",
-            "dns" to "DNS",
-            "cdn" to "CDN",
-            "rpc" to "RPC",
-            "ide" to "IDE",
-            "vcs" to "VCS",
-            "scm" to "SCM"
-        )
-
-        techTerms.forEach { (pinyin, word) ->
-            val values = ContentValues().apply {
-                put(COL_PINYIN, pinyin.lowercase())
-                put(COL_WORD, word)
-                put(COL_FREQ, 100) // High frequency for tech terms
-                put(COL_DIGITS, toDigits(pinyin))
-            }
-            db.insert(TABLE_WORDS, null, values)
-        }
-
-        // Insert some common Chinese words
-        val commonWords = listOf(
-            "zhong" to "中",
-            "guo" to "国",
-            "ren" to "人",
-            "da" to "大",
-            "xiao" to "小",
-            "shang" to "上",
-            "xia" to "下",
-            "zuo" to "左",
-            "you" to "右",
-            "qian" to "前",
-            "hou" to "后",
-            "tian" to "天",
-            "di" to "地",
-            "ri" to "日",
-            "yue" to "月",
-            "nian" to "年",
-            "shi" to "是",
-            "de" to "的",
-            "le" to "了",
-            "wo" to "我",
-            "ni" to "你",
-            "ta" to "他",
-            "men" to "们",
-            "zhe" to "这",
-            "na" to "那",
-            "ge" to "个",
-            "shi" to "时",
-            "jian" to "间",
-            "xue" to "学",
-            "sheng" to "生",
-            "gong" to "工",
-            "zuo" to "作",
-            "cheng" to "程",
-            "xu" to "序",
-            "yuan" to "员",
-            "kai" to "开",
-            "fa" to "发",
-            "ce" to "测",
-            "shi" to "试",
-            "bu" to "部",
-            "shu" to "数",
-            "ju" to "据",
-            "ku" to "库",
-            "biao" to "表",
-            "fu" to "服",
-            "wu" to "务",
-            "qi" to "器",
-            "wang" to "网",
-            "luo" to "络",
-            "an" to "安",
-            "quan" to "全",
-            "fang" to "防",
-            "hu" to "护",
-            "mi" to "密",
-            "ma" to "码",
-            "jian" to "键",
-            "pan" to "盘",
-            "shu" to "输",
-            "ru" to "入",
-            "fa" to "法",
-            "wen" to "文",
-            "ben" to "本",
-            "zi" to "字",
-            "fu" to "符",
-            "hao" to "好",
-            "hen" to "很",
-            "hao" to "号",
-            "ma" to "吗",
-            "ne" to "呢",
-            "ba" to "吧",
-            "a" to "啊",
-            "o" to "哦",
-            "en" to "嗯",
-            "zhongguo" to "中国",
-            "renmen" to "人们",
-            "daxue" to "大学",
-            "xiaoxue" to "小学",
-            "shangwu" to "上午",
-            "xiawu" to "下午",
-            "zuotian" to "昨天",
-            "jintian" to "今天",
-            "mingtian" to "明天",
-            "shijian" to "时间",
-            "xuesheng" to "学生",
-            "gongzuo" to "工作",
-            "chengxu" to "程序",
-            "kaifa" to "开发",
-            "ceshi" to "测试",
-            "shuju" to "数据",
-            "wangluo" to "网络",
-            "anquan" to "安全",
-            "fanghu" to "防护",
-            "mima" to "密码",
-            "jianpan" to "键盘",
-            "shuru" to "输入",
-            "wenben" to "文本",
-            "zifu" to "字符",
-            "haoma" to "号码",
-            "women" to "我们",
-            "nimen" to "你们",
-            "tamen" to "他们",
-            "zhege" to "这个",
-            "nage" to "那个",
-            "shenme" to "什么",
-            "zenme" to "怎么",
-            "weishenme" to "为什么",
-            "duoshao" to "多少",
-            "jige" to "几个",
-            "yige" to "一个",
-            "liangge" to "两个",
-            "henduo" to "很多",
-            "yixie" to "一些",
-            "meiyou" to "没有",
-            "you" to "有",
-            "shi" to "十",
-            "bai" to "百",
-            "qian" to "千",
-            "wan" to "万",
-            "ling" to "零",
-            "yi" to "一",
-            "er" to "二",
-            "san" to "三",
-            "si" to "四",
-            "wu" to "五",
-            "liu" to "六",
-            "qi" to "七",
-            "ba" to "八",
-            "jiu" to "九",
-            "dongxi" to "东西",
-            "fangxiang" to "方向",
-            "difang" to "地方",
-            "mingzi" to "名字",
-            "dianhua" to "电话",
-            "diannao" to "电脑",
-            "shouji" to "手机",
-            "pingguo" to "苹果",
-            "xiangjiao" to "香蕉",
-            "chengzi" to "橙子",
-            "putao" to "葡萄",
-            "xigua" to "西瓜",
-            "fanqie" to "番茄",
-            "tudou" to "土豆",
-            "luobo" to "萝卜",
-            "baicai" to "白菜",
-            "jidan" to "鸡蛋",
-            "niunai" to "牛奶",
-            "kafei" to "咖啡",
-            "cha" to "茶",
-            "shui" to "水",
-            "mifan" to "米饭",
-            "miantiao" to "面条",
-            "jiaozi" to "饺子",
-            "baozi" to "包子",
-            "mantou" to "馒头",
-            "yuebing" to "月饼",
-            "zongzi" to "粽子",
-            "chuntian" to "春天",
-            "xiatian" to "夏天",
-            "qiutian" to "秋天",
-            "dongtian" to "冬天",
-            "zaoshang" to "早上",
-            "zhongwu" to "中午",
-            "wanshang" to "晚上",
-            "banye" to "半夜",
-            "xianzai" to "现在",
-            "yihou" to "以后",
-            "yiqian" to "以前",
-            "gangcai" to "刚才",
-            "kuai" to "快",
-            "man" to "慢",
-            "zao" to "早",
-            "wan" to "晚",
-            "chang" to "长",
-            "duan" to "短",
-            "gao" to "高",
-            "ai" to "矮",
-            "pang" to "胖",
-            "shou" to "瘦",
-            "mei" to "美",
-            "chou" to "丑",
-            "xin" to "新",
-            "jiu" to "旧",
-            "gui" to "贵",
-            "pianyi" to "便宜",
-            "dui" to "对",
-            "cuo" to "错",
-            "zhen" to "真",
-            "jia" to "假",
-            "huai" to "坏",
-            "leng" to "冷",
-            "re" to "热",
-            "nuan" to "暖",
-            "liang" to "凉",
-            "gan" to "干",
-            "shi" to "湿",
-            "zhong" to "重",
-            "qing" to "轻",
-            "ruan" to "软",
-            "ying" to "硬",
-            "hei" to "黑",
-            "bai" to "白",
-            "hong" to "红",
-            "huang" to "黄",
-            "lan" to "蓝",
-            "lv" to "绿",
-            "zi" to "紫",
-            "cheng" to "橙",
-            "fen" to "粉",
-            "hui" to "灰",
-            "zong" to "棕",
-            "jin" to "金",
-            "yin" to "银",
-            "tong" to "铜",
-            "tie" to "铁",
-            "gang" to "钢",
-            "shi" to "石",
-            "mu" to "木",
-            "huo" to "火",
-            "tu" to "土",
-            "shan" to "山",
-            "he" to "河",
-            "hai" to "海",
-            "hu" to "湖",
-            "jiang" to "江",
-            "xi" to "溪",
-            "quan" to "泉",
-            "jing" to "井",
-            "tian" to "田",
-            "lu" to "路",
-            "qiao" to "桥",
-            "men" to "门",
-            "chuang" to "窗",
-            "qiang" to "墙",
-            "wading" to "屋顶",
-            "louti" to "楼梯",
-            "dianti" to "电梯",
-            "zoulang" to "走廊",
-            "keting" to "客厅",
-            "woshi" to "卧室",
-            "chufang" to "厨房",
-            "weishengjian" to "卫生间",
-            "yushi" to "浴室",
-            "yangtai" to "阳台",
-            "huayuan" to "花园",
-            "tingyuan" to "庭院",
-            "chekui" to "车库",
-            "cangku" to "仓库",
-            "bangongshi" to "办公室",
-            // 高频功能词与常用疑问/能愿结构
-            "neng" to "能",
-            "nengbu" to "能不",
-            "nengbuneng" to "能不能",
-            "keyi" to "可以",
-            "keyima" to "可以吗",
-            "buxing" to "不行",
-            "shibushi" to "是不是",
-            "youmeiyou" to "有没有",
-            "hui" to "会",
-            "huiyi" to "会议",
-            "huibuhui" to "会不会",
-            "yaobuyao" to "要不要",
-            "xiang" to "想",
-            "xiangyao" to "想要",
-            "yinggai" to "应该",
-            "xuyao" to "需要",
-            "ganxie" to "感谢",
-            "bangzhu" to "帮助",
-            "wenti" to "问题",
-            "jueding" to "决定",
-            "kaishi" to "开始",
-            "jieshu" to "结束",
-            "zhunbei" to "准备",
-            "jihua" to "计划",
-            // “度”类高频词与常用搭配
-            "du" to "度",
-            "gaodu" to "高度",
-            "sudu" to "速度",
-            "wendu" to "温度",
-            "jiaodu" to "角度",
-            "shendu" to "深度",
-            "yingdu" to "硬度",
-            "shidu" to "湿度",
-            "kuandu" to "宽度",
-            "changdu" to "长度",
-            "houdu" to "厚度",
-            "nongdu" to "浓度",
-            "qiangdu" to "强度",
-            "yuedu" to "阅读",
-            "gaoxing" to "高兴",
-            "gaoshou" to "高手",
-            "gaoji" to "高级",
-            "gaosu" to "高速",
-            "gaobie" to "告别",
-            "gaozhi" to "告知",
-            "gailv" to "概率",
-            "gaibian" to "改变",
-            "gaishan" to "改善",
-            "gaikuang" to "概况",
-            "gainian" to "概念",
-            "jiaoshi" to "教室",
-            "tushuguan" to "图书馆",
-            "bowuguan" to "博物馆",
-            "yiyuan" to "医院",
-            "yaodian" to "药店",
-            "chaoshi" to "超市",
-            "shangdian" to "商店",
-            "fandian" to "饭店",
-            "jiudian" to "酒店",
-            "lvguan" to "旅馆",
-            "binguan" to "宾馆",
-            "jichang" to "机场",
-            "huochezhan" to "火车站",
-            "qichezhan" to "汽车站",
-            "ditiezhan" to "地铁站",
-            "gongjiaozhan" to "公交车站",
-            "tingchechang" to "停车场",
-            "jiayouzhan" to "加油站",
-            "yinhang" to "银行",
-            "youju" to "邮局",
-            "dianxinju" to "电信局",
-            "gonganju" to "公安局",
-            "xiaofangju" to "消防局",
-            "zhengfu" to "政府",
-            "xuexiao" to "学校",
-            "zhongxue" to "中学",
-            "youeryuan" to "幼儿园",
-            "yanjiusheng" to "研究生",
-            "boshi" to "博士",
-            "shuoshi" to "硕士",
-            "benke" to "本科",
-            "zhuanke" to "专科",
-            "tongxue" to "同学",
-            "laoshi" to "老师",
-            "jiaoshou" to "教授",
-            "zhuren" to "主任",
-            "xiaozhang" to "校长",
-            "yisheng" to "医生",
-            "hushi" to "护士",
-            "bingren" to "病人",
-            "jingcha" to "警察",
-            "junren" to "军人",
-            "nongmin" to "农民",
-            "gongren" to "工人",
-            "shangren" to "商人",
-            "zuojia" to "作家",
-            "huajia" to "画家",
-            "yinyuejia" to "音乐家",
-            "daoyan" to "导演",
-            "yanyuan" to "演员",
-            "geshou" to "歌手",
-            "wujia" to "舞家",
-            "tiyuan" to "体院",
-            "jiaolian" to "教练",
-            "caipan" to "裁判",
-            "xuanshou" to "选手",
-            "duiyou" to "队友",
-            "duishou" to "对手",
-            "pengyou" to "朋友",
-            "tongshi" to "同事",
-            "lingdao" to "领导",
-            "xiaji" to "下级",
-            "kehu" to "客户",
-            "guke" to "顾客",
-            "xiaofeizhe" to "消费者",
-            "yonghu" to "用户",
-            "huiyuan" to "会员",
-            "fensi" to "粉丝",
-            "wangyou" to "网友",
-            "linju" to "邻居",
-            "qinqi" to "亲戚",
-            "jiaren" to "家人",
-            "fumu" to "父母",
-            "baba" to "爸爸",
-            "mama" to "妈妈",
-            "die" to "爹",
-            "niang" to "娘",
-            "erzi" to "儿子",
-            "nv" to "女",
-            "nver" to "女儿",
-            "gege" to "哥哥",
-            "didi" to "弟弟",
-            "jiejie" to "姐姐",
-            "meimei" to "妹妹",
-            "yeye" to "爷爷",
-            "nainai" to "奶奶",
-            "waigong" to "外公",
-            "waipo" to "外婆",
-            "bofu" to "伯父",
-            "bomu" to "伯母",
-            "shushu" to "叔叔",
-            "shen" to "婶",
-            "jiujiu" to "舅舅",
-            "jiuma" to "舅妈",
-            "yima" to "姨妈",
-            "yifu" to "姨父",
-            "tangge" to "堂哥",
-            "tangdi" to "堂弟",
-            "tangjie" to "堂姐",
-            "tangmei" to "堂妹",
-            "biaoge" to "表哥",
-            "biaodi" to "表弟",
-            "biaojie" to "表姐",
-            "biaomei" to "表妹",
-            "zhizi" to "侄子",
-            "zhinv" to "侄女",
-            "waisheng" to "外甥",
-            "waishengnv" to "外甥女",
-            "sunzi" to "孙子",
-            "sunnv" to "孙女",
-            "laogong" to "老公",
-            "laopo" to "老婆",
-            "zhangfu" to "丈夫",
-            "qizi" to "妻子",
-            "nanpengyou" to "男朋友",
-            "nvpengyou" to "女朋友",
-            "duixiang" to "对象",
-            "lianren" to "恋人",
-            "airen" to "爱人",
-            "peiou" to "配偶",
-            "banlv" to "伴侣",
-            "zhiji" to "知己",
-            "miyue" to "蜜月",
-            "hunyin" to "婚姻",
-            "jiating" to "家庭",
-            "qinzi" to "亲子",
-            "jiazhang" to "家长",
-            "haizi" to "孩子",
-            "ertong" to "儿童",
-            "yinger" to "婴儿",
-            "youer" to "幼儿",
-            "shaonian" to "少年",
-            "qingnian" to "青年",
-            "zhongnian" to "中年",
-            "laonian" to "老年",
-            "laoren" to "老人",
-            "nianqing" to "年轻",
-            "nianlao" to "年老",
-            "chengnian" to "成年",
-            "weichengnian" to "未成年",
-            "shengri" to "生日",
-            "nianling" to "年龄",
-            "sui" to "岁",
-            "yuesao" to "月嫂",
-            "baomu" to "保姆",
-            "hugong" to "护工",
-            "qingjie" to "清洁",
-            "xiuyuan" to "修员",
-            "anmo" to "按摩",
-            "meifa" to "美发",
-            "meirong" to "美容",
-            "jianshen" to "健身",
-            "yuji" to "瑜伽",
-            "youyong" to "游泳",
-            "paobu" to "跑步",
-            "lanqiu" to "篮球",
-            "zuqiu" to "足球",
-            "paiqiu" to "排球",
-            "yumaoqiu" to "羽毛球",
-            "pingpangqiu" to "乒乓球",
-            "wangqiu" to "网球",
-            "gaoerfu" to "高尔夫",
-            "bingqiu" to "冰球",
-            "huabing" to "滑冰",
-            "huaxue" to "滑雪",
-            "qiche" to "汽车",
-            "zixingche" to "自行车",
-            "diandongche" to "电动车",
-            "motuoche" to "摩托车",
-            "gonggongqiche" to "公共汽车",
-            "chuzuche" to "出租车",
-            "didi" to "滴滴",
-            "kuaidi" to "快递",
-            "waimai" to "外卖",
-            "taobao" to "淘宝",
-            "jingdong" to "京东",
-            "pinduoduo" to "拼多多",
-            "meituan" to "美团",
-            "eleme" to "饿了么",
-            "zhifubao" to "支付宝",
-            "weixin" to "微信",
-            "qq" to "QQ",
-            "douyin" to "抖音",
-            "kuaishou" to "快手",
-            "bilibili" to "哔哩哔哩",
-            "youku" to "优酷",
-            "aiqiyi" to "爱奇艺",
-            "tengxunshipin" to "腾讯视频",
-            "wangyiyunyinyue" to "网易云音乐",
-            "qqyinyue" to "QQ音乐",
-            "kugou" to "酷狗",
-            "kuwo" to "酷我",
-            "xiami" to "虾米",
-            "douban" to "豆瓣",
-            "zhihu" to "知乎",
-            "weibo" to "微博",
-            "tieba" to "贴吧",
-            "luntan" to "论坛",
-            "shequ" to "社区",
-            "wangzhan" to "网站",
-            "yingyong" to "应用",
-            "ruanjian" to "软件",
-            "yingjian" to "硬件",
-            "xitong" to "系统",
-            "caozuoxitong" to "操作系统",
-            "anzhuo" to "安卓",
-            "huawei" to "华为",
-            "xiaomi" to "小米",
-            "oppo" to "OPPO",
-            "vivo" to "VIVO",
-            "sanxing" to "三星",
-            "meizu" to "魅族",
-            "yijia" to "一加",
-            "zhenwo" to "真我",
-            "hongmi" to "红米",
-            "rongyao" to "荣耀"
-        )
-
-        commonWords.forEach { (pinyin, word) ->
-            val values = ContentValues().apply {
-                put(COL_PINYIN, pinyin.lowercase())
-                put(COL_WORD, word)
-                // 手编最高频词档：高于单字分层词频（55~85）与词组（46~50）
-                put(COL_FREQ, 90)
-                put(COL_DIGITS, toDigits(pinyin))
-            }
-            db.insert(TABLE_WORDS, null, values)
-        }
-    }
-
-    /**
-     * 从资产文件批量导入词条（每行 "拼音 词条 词频"，空格分隔）。
-     * 精编词组先插入，资产词条用 CONFLICT_IGNORE 避免覆盖；事务提交保证性能。
-     */
-    private fun loadAssetWords(db: SQLiteDatabase, assetName: String) {
-        val lines = try {
-            appContext.assets.open(assetName).bufferedReader().use { it.readLines() }
-        } catch (e: Exception) {
-            return
-        }
-
-        // 预编译插入语句：40 万条导入时避免逐条编译，速度提升一个数量级
-        val insert = db.compileStatement(
-            "INSERT OR IGNORE INTO $TABLE_WORDS($COL_PINYIN, $COL_WORD, $COL_FREQ, $COL_DIGITS) VALUES(?,?,?,?)"
-        )
-        db.beginTransaction()
-        try {
-            for (line in lines) {
-                val parts = line.split(' ')
-                if (parts.size != 3) continue
-                val pinyin = parts[0]
-                val word = parts[1]
-                val freq = parts[2].toIntOrNull() ?: continue
-                insert.bindString(1, pinyin)
-                insert.bindString(2, word)
-                insert.bindLong(3, freq.toLong())
-                insert.bindString(4, toDigits(pinyin))
-                insert.executeInsert()
-            }
-            db.setTransactionSuccessful()
-        } finally {
-            db.endTransaction()
-            insert.close()
-        }
-    }
-
-    /** 后台预热：触发首次建库与资产导入，避免用户第一次按键时卡住主线程 */
-    fun warmUp() {
-        readableDatabase
-        ready = true
-    }
-
-    fun queryWords(pinyin: String, limit: Int = 20): List<Pair<String, Int>> {
-        val words = mutableListOf<Pair<String, Int>>()
-        val db = readableDatabase
-
-        // GLOB 大小写敏感，可走 BINARY 索引范围扫描；LIKE 在 BINARY 列上不会用索引
-        val cursor = db.query(
-            TABLE_WORDS,
-            arrayOf(COL_WORD, COL_FREQ),
-            "$COL_PINYIN GLOB ?",
-            arrayOf(pinyin.lowercase() + "*"),
-            null, null,
-            "$COL_FREQ DESC",
-            limit.toString()
-        )
-
-        cursor.use {
-            while (it.moveToNext()) {
-                val word = it.getString(0)
-                val freq = it.getInt(1)
-                words.add(word to freq)
-            }
-        }
-
-        return words
-    }
-
-    /** T9 前缀匹配：查数字序列以输入数字开头的所有词条（含更长词的续打匹配）。
-     *  返回 (词条, 带音节分隔的拼音, 词频)，供引擎校验强制音节边界。 */
-    fun queryByDigitsPrefix(digits: String, limit: Int): List<Triple<String, String, Int>> =
-        queryByDigits("$COL_DIGITS GLOB ?", "$digits*", limit)
-
-    /** T9 精确匹配：数字序列与输入完全相等的词条 */
-    fun queryByDigitsExact(digits: String, limit: Int): List<Triple<String, String, Int>> =
-        queryByDigits("$COL_DIGITS = ?", digits, limit)
-
-    /** T9 精确匹配 + 拼音前缀过滤：用户在拼音选择列选了某个读法时使用。
-     *  拼音过滤下推到 DB（走 (pinyin, freq) 索引 + digits 等值双条件），
-     *  避免只在内存小窗口内过滤导致该读法的字被窗口截断。 */
-    fun queryByDigitsExactAndPinyin(digits: String, pinyinPrefix: String, limit: Int): List<Triple<String, String, Int>> {
-        val words = mutableListOf<Triple<String, String, Int>>()
-        val db = readableDatabase
-        val cursor = db.query(
-            TABLE_WORDS,
-            arrayOf(COL_WORD, COL_PINYIN, COL_FREQ),
-            "$COL_DIGITS = ? AND $COL_PINYIN GLOB ?",
-            arrayOf(digits, pinyinPrefix + "*"),
-            null, null,
-            "$COL_FREQ DESC",
-            limit.toString()
-        )
-        cursor.use {
-            while (it.moveToNext()) {
-                words.add(Triple(it.getString(0), it.getString(1), it.getInt(2)))
-            }
-        }
-        return words
-    }
-
-    private fun queryByDigits(where: String, arg: String, limit: Int): List<Triple<String, String, Int>> {
-        val words = mutableListOf<Triple<String, String, Int>>()
-        val db = readableDatabase
-
-        val cursor = db.query(
-            TABLE_WORDS,
-            arrayOf(COL_WORD, COL_PINYIN, COL_FREQ),
-            where,
-            arrayOf(arg),
-            null, null,
-            // 词频降序可走复合索引免排序；同频短词优先在引擎层内存排序
-            "$COL_FREQ DESC",
-            limit.toString()
-        )
-
-        cursor.use {
-            while (it.moveToNext()) {
-                words.add(Triple(it.getString(0), it.getString(1), it.getInt(2)))
-            }
-        }
-
-        return words
-    }
-
-    /** 联想查询：以已上屏词为前缀的更长词条（如 中国 -> 中国人），按词频降序。
-     *  word 列 GLOB 前缀匹配走 idx_words_word 索引；排除原词自身 */
-    fun queryWordsByPrefix(prefix: String, limit: Int): List<Triple<String, String, Int>> {
-        val words = mutableListOf<Triple<String, String, Int>>()
-        val db = readableDatabase
-        val cursor = db.query(
-            TABLE_WORDS,
-            arrayOf(COL_WORD, COL_PINYIN, COL_FREQ),
-            "$COL_WORD GLOB ? AND $COL_WORD != ?",
-            arrayOf(prefix + "*", prefix),
-            null, null,
-            "$COL_FREQ DESC",
-            limit.toString()
-        )
-        cursor.use {
-            while (it.moveToNext()) {
-                words.add(Triple(it.getString(0), it.getString(1), it.getInt(2)))
-            }
-        }
-        return words
-    }
-
-    /** 拼音精确匹配的最高词频词条（读法成词加成用）。
-     *  不能用 queryWords 的前缀 GLOB：biao'ji* 会误命中 biao'jie（表姐），
-     *  把非词读法的加成算成更长词的词频，导致读法排序错乱 */
-    fun queryTopWordByPinyinExact(pinyin: String): Pair<String, Int>? {
-        val db = readableDatabase
-        db.query(
-            TABLE_WORDS,
-            arrayOf(COL_WORD, COL_FREQ),
-            "$COL_PINYIN = ?",
-            arrayOf(pinyin),
-            null, null,
-            "$COL_FREQ DESC",
-            "1"
-        ).use { c ->
-            if (c.moveToFirst()) return c.getString(0) to c.getInt(1)
-        }
-        return null
-    }
-
-    /**
-     * 按拼音+词条提升词频（用户选词学习）。异步执行 + pinyin 索引，不阻塞主线程。
-     * 用户词保护档：词频低于 USER_TIER 时直接跳档（一次上屏即可置顶），已入档则继续 +1。
-     *
-     * word 条件不可省：九键并键导致大量同音异义词（你好/昵好 同为 ni'hao），
-     * 只按 pinyin 更新会把用户没选中的同音词一起抬进保护档，「昵好」从此永久霸占候选首位。
-     */
-    fun incrementFrequency(pinyin: String, word: String) {
-        ioScope.launch {
-            writableDatabase.execSQL(
-                "UPDATE $TABLE_WORDS SET $COL_FREQ = CASE WHEN $COL_FREQ < $USER_TIER THEN $USER_TIER ELSE $COL_FREQ + 1 END WHERE $COL_PINYIN = ? AND $COL_WORD = ?",
-                arrayOf(pinyin, word)
-            )
-        }
-    }
-
-    fun insertWord(pinyin: String, word: String, frequency: Int = 1) {
-        val db = writableDatabase
-        val values = ContentValues().apply {
-            put(COL_PINYIN, pinyin.lowercase())
-            put(COL_WORD, word)
-            put(COL_FREQ, frequency)
-            put(COL_DIGITS, toDigits(pinyin))
-        }
-        db.insertWithOnConflict(TABLE_WORDS, null, values, SQLiteDatabase.CONFLICT_REPLACE)
-    }
-
-    /**
-     * 真实词频分级：按《现代汉语常用词表》频级名次给多字词分档。
-     * 档位设计：均高于资产平档 50（拉开区分度）、低于手编词 90 与用户档 95；
-     * 仅升不降，不覆盖已有高档位（种子/学习成果）；只处理 2+ 字词，
-     * 单字由 char_boost 专管，避免两套体系互相覆盖。
-     */
-    private fun applyWordFreqTiers(db: SQLiteDatabase) {
-        val lines = try {
-            appContext.assets.open(ASSET_WORD_FREQ).bufferedReader().use { it.readLines() }
-        } catch (e: Exception) {
-            return
-        }
-        val update = db.compileStatement(
-            "UPDATE $TABLE_WORDS SET $COL_FREQ = ? WHERE $COL_WORD = ? AND length($COL_WORD) >= 2 AND $COL_FREQ < ?"
-        )
-        db.beginTransaction()
-        try {
-            for (line in lines) {
-                val parts = line.split(' ')
-                if (parts.size != 2) continue
-                val rank = parts[1].toIntOrNull() ?: continue
-                val tier = tierForRank(rank)
-                update.bindLong(1, tier.toLong())
-                update.bindString(2, parts[0])
-                update.bindLong(3, tier.toLong())
-                update.executeUpdateDelete()
-            }
-            db.setTransactionSuccessful()
-        } finally {
-            db.endTransaction()
-            update.close()
-        }
-    }
-
-    /**
-     * 频级名次 -> 词频档位。
-     * 旧版只分 5 档（88/84/78/70/62），5.5 万词挤进 5 个离散值：同音组内大量常用词并列，
-     * 排序最终退化成入库顺序（不可预测，「你好」被同档生僻词挤到第 6 就是这种"平局"造成的）。
-     * 改成 8 档并压缩头部区间（1000 名以内拉开 3 档），让常用区有真实分辨率。
-     * 头部上限压在 89 而非 90/88，避免撞上手编词 90 与常用词 88 两个既有档位。
-     */
-    private fun tierForRank(rank: Int): Int = when {
-        rank <= 1000 -> 89
-        rank <= 3000 -> 86
-        rank <= 8000 -> 83
-        rank <= 15000 -> 79
-        rank <= 25000 -> 74
-        rank <= 35000 -> 70
-        rank <= 45000 -> 65
-        else -> 62
-    }
-
-    /**
-     * 常用词升档：按资产表把精选高频词升到 COMMON_TIER。
-     * 仅升不降（词频已 >= COMMON_TIER 的不动，保护手编词/用户学习成果）；事务 + 预编译批量更新。
-     */
-    private fun boostCommonWords(db: SQLiteDatabase) {
-        val lines = try {
-            appContext.assets.open(ASSET_COMMON_BOOST).bufferedReader().use { it.readLines() }
-        } catch (e: Exception) {
-            return
-        }
-        val update = db.compileStatement(
-            "UPDATE $TABLE_WORDS SET $COL_FREQ = $COMMON_TIER WHERE $COL_PINYIN = ? AND $COL_WORD = ? AND $COL_FREQ < $COMMON_TIER"
-        )
-        db.beginTransaction()
-        try {
-            for (line in lines) {
-                val parts = line.split(' ')
-                if (parts.size != 2) continue
-                update.bindString(1, parts[0])
-                update.bindString(2, parts[1])
-                update.executeUpdateDelete()
-            }
-            db.setTransactionSuccessful()
-        } finally {
-            db.endTransaction()
-            update.close()
-        }
-    }
-
-    /**
-     * 多音字补丁：按资产表（拼音 字）插入单字缺失的常用读音。
-     * INSERT OR IGNORE 幂等；补入读音统一置 MULTI_PRON_TIER 档。
-     */
-    private fun insertMultiPron(db: SQLiteDatabase) {
-        val lines = try {
-            appContext.assets.open(ASSET_MULTI_PRON).bufferedReader().use { it.readLines() }
-        } catch (e: Exception) {
-            return
-        }
-        val insert = db.compileStatement(
-            "INSERT OR IGNORE INTO $TABLE_WORDS($COL_PINYIN, $COL_WORD, $COL_FREQ, $COL_DIGITS) VALUES(?,?,?,?)"
-        )
-        val update = db.compileStatement(
-            "UPDATE $TABLE_WORDS SET $COL_FREQ = $MULTI_PRON_TIER WHERE $COL_PINYIN = ? AND $COL_WORD = ? AND $COL_FREQ < $MULTI_PRON_TIER"
-        )
-        db.beginTransaction()
-        try {
-            for (line in lines) {
-                val parts = line.split(' ')
-                if (parts.size != 2) continue
-                val pinyin = parts[0]
-                val word = parts[1]
-                insert.bindString(1, pinyin)
-                insert.bindString(2, word)
-                insert.bindLong(3, MULTI_PRON_TIER.toLong())
-                insert.bindString(4, toDigits(pinyin))
-                insert.executeInsert()
-                update.bindString(1, pinyin)
-                update.bindString(2, word)
-                update.executeUpdateDelete()
-            }
-            db.setTransactionSuccessful()
-        } finally {
-            db.endTransaction()
-            insert.close()
-            update.close()
-        }
-    }
-
-    /**
-     * 常用单字升档：按资产表（字 词频）提升单字词频，覆盖该字所有读音行。
-     * 仅升不降，保护手编档与用户学习成果。
-     */
-    private fun boostCommonChars(db: SQLiteDatabase) {
-        val lines = try {
-            appContext.assets.open(ASSET_CHAR_BOOST).bufferedReader().use { it.readLines() }
-        } catch (e: Exception) {
-            return
-        }
-        val update = db.compileStatement(
-            "UPDATE $TABLE_WORDS SET $COL_FREQ = ? WHERE $COL_WORD = ? AND length($COL_WORD) = 1 AND $COL_FREQ < ?"
-        )
-        db.beginTransaction()
-        try {
-            for (line in lines) {
-                val parts = line.split(' ')
-                if (parts.size != 2) continue
-                val freq = parts[1].toIntOrNull() ?: continue
-                update.bindLong(1, freq.toLong())
-                update.bindString(2, parts[0])
-                update.bindLong(3, freq.toLong())
-                update.executeUpdateDelete()
-            }
-            db.setTransactionSuccessful()
-        } finally {
-            db.endTransaction()
-            update.close()
-        }
-    }
-
-    /**
-     * 口语高频词升档：把 oral_boost.txt 里的问候/应答/口头结构提到 ORAL_TIER。
-     * 仅升不降（词频已 >= ORAL_TIER 的不动，保护用户学习成果）。
-     * 必须在 applyWordFreqTiers 之后执行——先用真实词频分档，再用口语档兜底补漏，
-     * 这样「你好」这类词表漏收的也能拿到 92，压过同键的 62 档生僻词。
-     */
-    private fun applyOralBoost(db: SQLiteDatabase) {
-        val lines = try {
-            appContext.assets.open(ASSET_ORAL_BOOST).bufferedReader().use { it.readLines() }
-        } catch (e: Exception) {
-            return
-        }
-        val update = db.compileStatement(
-            "UPDATE $TABLE_WORDS SET $COL_FREQ = $ORAL_TIER WHERE $COL_PINYIN = ? AND $COL_WORD = ? AND $COL_FREQ < $ORAL_TIER"
-        )
-        db.beginTransaction()
-        try {
-            for (line in lines) {
-                val parts = line.split(' ')
-                if (parts.size != 2) continue
-                update.bindString(1, parts[0])
-                update.bindString(2, parts[1])
-                update.executeUpdateDelete()
-            }
-            db.setTransactionSuccessful()
-        } finally {
-            db.endTransaction()
-            update.close()
-        }
-    }
-
-    /**
-     * 重复词条归一：手编种子用连写拼音（zhongguo），资产词组用分隔拼音（zhong'guo），
-     * 同一词双条并存浪费名额且学习只命中一条。合并为分隔拼音单条：
-     * 分隔行词频取同词同数字各条最大值（保留手编 90 档），再删除连写重复行。
-     * 仅处理 length>=2 的多字词，单字多读音行不受影响。
-     */
-    private fun normalizeWordDuplicates(db: SQLiteDatabase) {
-        db.beginTransaction()
-        try {
-            db.execSQL(
-                "UPDATE $TABLE_WORDS SET $COL_FREQ = (" +
-                    "SELECT MAX(w2.$COL_FREQ) FROM $TABLE_WORDS w2 " +
-                    "WHERE w2.$COL_WORD = $TABLE_WORDS.$COL_WORD AND w2.$COL_DIGITS = $TABLE_WORDS.$COL_DIGITS" +
-                    ") WHERE $COL_PINYIN GLOB '*''*' AND length($COL_WORD) >= 2 AND EXISTS (" +
-                    "SELECT 1 FROM $TABLE_WORDS w3 " +
-                    "WHERE w3.$COL_WORD = $TABLE_WORDS.$COL_WORD AND w3.$COL_DIGITS = $TABLE_WORDS.$COL_DIGITS " +
-                    "AND w3.$COL_PINYIN NOT GLOB '*''*'" +
-                    ")"
-            )
-            db.execSQL(
-                "DELETE FROM $TABLE_WORDS WHERE $COL_PINYIN NOT GLOB '*''*' AND length($COL_WORD) >= 2 AND EXISTS (" +
-                    "SELECT 1 FROM $TABLE_WORDS w4 " +
-                    "WHERE w4.$COL_WORD = $TABLE_WORDS.$COL_WORD AND w4.$COL_DIGITS = $TABLE_WORDS.$COL_DIGITS " +
-                    "AND w4.$COL_PINYIN GLOB '*''*'" +
-                    ")"
-            )
-            db.setTransactionSuccessful()
-        } finally {
-            db.endTransaction()
-        }
-    }
-
-    /**
-     * 用户连续上屏组词学习：新词以指定词频插入，幂等；
-     * 若词已存在但词频低于该值（资产平档词），一并升上来，让学习立即可见。
-     * 用户再次选中它时，常规学习（incrementFrequency）将其升入用户保护档——误学的垃圾词不会被再次选中，自然沉淀。
-     */
-    fun learnUserWord(pinyin: String, word: String, freq: Int) {
-        ioScope.launch {
-            val db = writableDatabase
-            val values = ContentValues().apply {
-                put(COL_PINYIN, pinyin.lowercase())
-                put(COL_WORD, word)
-                put(COL_FREQ, freq)
-                put(COL_DIGITS, toDigits(pinyin))
-            }
-            db.insertWithOnConflict(TABLE_WORDS, null, values, SQLiteDatabase.CONFLICT_IGNORE)
-            db.execSQL(
-                "UPDATE $TABLE_WORDS SET $COL_FREQ = ? WHERE $COL_PINYIN = ? AND $COL_WORD = ? AND $COL_FREQ < ?",
-                arrayOf(freq, pinyin.lowercase(), word, freq)
-            )
-        }
-    }
-
-    /**
-     * 学习用户组合新词（整句候选上屏时调用）：
-     * 词库没有则新建（直接入用户保护档），已有则升档/+1。
-     * 用 CONFLICT_IGNORE + UPDATE，避免 REPLACE 把已有词条词频清零重建。
-     */
-    fun learnPhrase(pinyin: String, word: String) {
-        ioScope.launch {
-            val db = writableDatabase
-            val values = ContentValues().apply {
-                put(COL_PINYIN, pinyin.lowercase())
-                put(COL_WORD, word)
-                put(COL_FREQ, USER_TIER)
-                put(COL_DIGITS, toDigits(pinyin))
-            }
-            db.insertWithOnConflict(TABLE_WORDS, null, values, SQLiteDatabase.CONFLICT_IGNORE)
-            db.execSQL(
-                "UPDATE $TABLE_WORDS SET $COL_FREQ = CASE WHEN $COL_FREQ < $USER_TIER THEN $USER_TIER ELSE $COL_FREQ + 1 END WHERE $COL_PINYIN = ? AND $COL_WORD = ?",
-                arrayOf(pinyin.lowercase(), word)
-            )
-        }
-    }
-
-    /**
-     * 学习英文单词：已存在则词频 +1，否则新建记录。
-     * 仅接受纯英文字母的单词，避免中文拼音词条被误写。
-     */
-    fun learnEnglishWord(word: String) {
-        val lower = word.lowercase()
-        if (lower.isEmpty() || !lower.all { it in 'a'..'z' }) return
-
-        val db = writableDatabase
-        db.execSQL(
-            "UPDATE $TABLE_WORDS SET $COL_FREQ = $COL_FREQ + 1 WHERE $COL_PINYIN = ? AND $COL_WORD = ?",
-            arrayOf(lower, word)
-        )
-        val values = ContentValues().apply {
-            put(COL_PINYIN, lower)
-            put(COL_WORD, word)
-            put(COL_FREQ, 1)
-            put(COL_DIGITS, toDigits(lower))
-        }
-        // 已存在时忽略，避免覆盖刚更新的词频
-        db.insertWithOnConflict(TABLE_WORDS, null, values, SQLiteDatabase.CONFLICT_IGNORE)
     }
 }
+
+/**
+ * 词库返回的一条候选。
+ * @param score 毫纳特（自然对数 × 1000）：基础 logp + 用户偏好加成，越大越优
+ * @param flags 位标记：1=单字 4=领域词 8=拉丁词 16=口语词（由离线流水线写入）
+ */
+data class WordEntry(
+    val word: String,
+    val pinyin: String,
+    val score: Int,
+    val flags: Int = 0
+)

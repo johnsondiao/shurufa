@@ -261,24 +261,23 @@ android {
 
 ## 备份和恢复
 
-### 备份词库
-```bash
-# 需要 root 权限
-adb shell
-su
-cp /data/data/com.personal.ime/databases/dictionary.db /sdcard/
-exit
-adb pull /sdcard/dictionary.db
-```
+> 词库已分成两层（2026-10 架构调整后）：
+> - **基础词库**：随 APK 分发的只读文件，首次启动解压到应用私有目录，
+>   `files/dict/base_words.db`（约 25 MB，38.7 万条）。**不需要备份**——重装即恢复。
+> - **用户数据**：自己加的词与学出来的偏好，`databases/ime_user.db`。**这个才需要备份**。
+>
+> 用户数据可在「设置」里一键清空（旧版只能靠清除应用数据）。
+> 词库本体由离线流水线生成，见 `_tools/dict/build_base_words.py`。
 
-### 恢复词库
+### 备份 / 恢复用户数据
 ```bash
-adb push dictionary.db /sdcard/
-adb shell
-su
-cp /sdcard/dictionary.db /data/data/com.personal.ime/databases/
-chmod 660 /data/data/com.personal.ime/databases/dictionary.db
-exit
+# 备份（需 root；无 root 时用 adb backup 或直接备份整个应用数据）
+adb shell "su -c 'cp /data/data/com.personal.ime/databases/ime_user.db /sdcard/'"
+adb pull /sdcard/ime_user.db
+
+# 恢复
+adb push ime_user.db /sdcard/
+adb shell "su -c 'cp /sdcard/ime_user.db /data/data/com.personal.ime/databases/ && chmod 660 /data/data/com.personal.ime/databases/ime_user.db'"
 ```
 
 ## 技术支持

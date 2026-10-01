@@ -518,7 +518,7 @@ class PersonalIMEService : InputMethodService() {
     }
 
     /** T9 分词键（1 键）：在数字串中插入音节分隔符，强制切分如 94'26 = xi'an */
-    private fun handleT9Separator(digit: Char) {
+    private fun handleT9Separator() {
         associationCandidates = emptyList()
         feedbackManager.vibrate(vibrationStrength)
         // 不能开头、不能连续（仅在已有数字且末尾是数字时插入）
@@ -992,7 +992,7 @@ class PersonalIMEService : InputMethodService() {
             pinyinSelector?.addView(createPunctuationKey(p))
         }
         // 分词键：从原 1' 键位移入左列，插入音节分隔符（如 94'26 = xi'an）
-        pinyinSelector?.addView(createPunctuationKey("'") { handleT9Separator('1') })
+        pinyinSelector?.addView(createPunctuationKey("'") { handleT9Separator() })
     }
 
     /** 左侧标点列单项（高度对齐键盘行，点击直接上屏标点；可自定义点击行为） */
@@ -1100,14 +1100,14 @@ class PersonalIMEService : InputMethodService() {
                 // 同时把整句作为新词入库（用户组词能力），下次直接命中置顶。
                 // 限长 2~8 字：单字无组词意义，超长串避免误学垃圾组合。
                 candidate.components.forEachIndexed { i, py ->
-                    candidate.componentWords.getOrNull(i)?.let { pinyinEngine.incrementFrequency(py, it) }
+                    candidate.componentWords.getOrNull(i)?.let { pinyinEngine.learnSelection(py, it) }
                 }
                 if (candidate.text.length in 2..8) {
-                    pinyinEngine.learnPhrase(candidate.pinyin, candidate.text)
+                    pinyinEngine.addUserWord(candidate.pinyin, candidate.text)
                 }
             } else if (candidate.pinyin.isNotEmpty()) {
                 // 普通候选：按拼音+词条学习（只按拼音会连带抬高高同音词，如「你好」抬起「昵好」）
-                pinyinEngine.incrementFrequency(candidate.pinyin, candidate.text)
+                pinyinEngine.learnSelection(candidate.pinyin, candidate.text)
             }
         }
         currentInput = ""
@@ -1119,7 +1119,7 @@ class PersonalIMEService : InputMethodService() {
 
     /**
      * 连续上屏组词学习：把本次上屏追加到学习缓冲，累计 >=2 字时将整串作为新词入库。
-     * 只收纯中文、拼音完整的普通候选（整句候选已由 learnPhrase 学习，不重复入库）；
+     * 只收纯中文、拼音完整的普通候选（整句候选已由 commitCandidate 的整句分支入库，不重复入库）；
      * 总长超 8 字时丢弃旧缓冲重新累计，避免学进垃圾长串。
      * 新词起始词频 60：能进候选但不抢位；再次选中即升入用户保护档，误学词自然沉淀。
      */
@@ -1136,7 +1136,7 @@ class PersonalIMEService : InputMethodService() {
         if (learnBuffer.sumOf { it.text.length } >= 2) {
             val word = learnBuffer.joinToString("") { it.text }
             val pinyin = learnBuffer.joinToString("'") { it.pinyin }
-            pinyinEngine.learnUserWord(pinyin, word)
+            pinyinEngine.addUserWord(pinyin, word)
         }
     }
 
