@@ -14,8 +14,17 @@ import com.personal.ime.data.DictionaryDatabase
 class PinyinEngine(private val database: DictionaryDatabase) {
 
     /** components 仅整句候选使用：存各组成词的拼音（如 "che"、"tui"），上屏时逐词学习词频；
-     *  matchTier 记录匹配层级（0=恰好打完），供展示层把打完的词置顶 */
-    data class Candidate(val text: String, val frequency: Int, val pinyin: String = "", val components: List<String> = emptyList(), val matchTier: Int = 2)
+     *  matchTier 记录匹配层级（0=恰好打完），供展示层把打完的词置顶；
+     *  componentWords 与 components 一一对应存词条本身——逐词学习必须带词，
+     *  只给拼音会把同音异义词一并抬进用户档（「给我」的 gei'wo 若同组还有他词会被误伤） */
+    data class Candidate(
+        val text: String,
+        val frequency: Int,
+        val pinyin: String = "",
+        val components: List<String> = emptyList(),
+        val matchTier: Int = 2,
+        val componentWords: List<String> = emptyList()
+    )
 
     // T9 数字 -> 字母（用于候选栏拼音回显的分段计算）
     private val digitLetters = mapOf(
@@ -145,10 +154,13 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         // 得分 = 段均词频 + 数字长度加成：高频组合优先，且不会让低频单字词组（如 嗚嗚）
         // 靠“段数少”挤掉高频两段组合（如 给我=85+90）——旧规则“段数优先”曾导致 给我 打不出。
         // 同分时保留段数少者优先（倾向整词）
-        data class Path(val segments: Int, val score: Int, val text: String, val pinyin: String, val components: List<String>)
+        data class Path(
+            val segments: Int, val score: Int, val text: String, val pinyin: String,
+            val components: List<String>, val componentWords: List<String>
+        )
 
         val dp = Array(n + 1) { mutableListOf<Path>() }
-        dp[0].add(Path(0, 0, "", "", emptyList()))
+        dp[0].add(Path(0, 0, "", "", emptyList(), emptyList()))
         val K = 3              // 每个位置保留的候选路径数（控制规模）
         val MAX_WORD_DIGITS = 8 // 单词数字长上限（涵盖绝大多数 2-4 字词）
         val WORDS_PER_SUB = 6   // 每个子串取的词条数上限
@@ -177,7 +189,8 @@ class PinyinEngine(private val database: DictionaryDatabase) {
                                 prev.score + freq,
                                 prev.text + word,
                                 if (prev.pinyin.isEmpty()) pinyin else prev.pinyin + "'" + pinyin,
-                                prev.components + pinyin
+                                prev.components + pinyin,
+                                prev.componentWords + word
                             )
                         )
                     }
@@ -189,7 +202,7 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         // segments>=2 才是真正的“组合”（单词候选已由 inputT9 覆盖）
         return dp[n]
             .filter { it.segments >= 2 }
-            .map { Candidate(it.text, it.score, it.pinyin, it.components) }
+            .map { Candidate(it.text, it.score, it.pinyin, it.components, componentWords = it.componentWords) }
             .distinctBy { it.text }
             .take(limit)
     }
@@ -425,9 +438,9 @@ class PinyinEngine(private val database: DictionaryDatabase) {
     /** 拼音 → T9 数字序列 */
     fun pinyinToDigits(pinyin: String): String = DictionaryDatabase.toDigits(pinyin)
 
-    /** 用户选词后提升词频：传入拼音定位词条 */
-    fun incrementFrequency(pinyin: String) {
-        database.incrementFrequency(pinyin)
+    /** 用户选词后提升词频：拼音+词条共同定位（只按拼音会误抬同音词） */
+    fun incrementFrequency(pinyin: String, word: String) {
+        database.incrementFrequency(pinyin, word)
     }
 
     fun addWord(pinyin: String, word: String) {

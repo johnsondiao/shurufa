@@ -10,7 +10,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 class DictionaryDatabase(private val appContext: Context) :
-    SQLiteOpenHelper(appContext, "dictionary.db", null, 15) {
+    SQLiteOpenHelper(appContext, "dictionary.db", null, 16) {
 
     /** 词频学习等写操作放到 IO 线程，避免主线程卡顿（用户上屏每个词都会触发） */
     private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -72,6 +72,16 @@ class DictionaryDatabase(private val appContext: Context) :
          *  补入常用缺失读音（hang 行 等），否则用户打另一读音永远出不来该字 */
         private const val ASSET_MULTI_PRON = "multi_pron.txt"
 
+        /**
+         * 口语高频词升档表（拼音 词）。
+         * 背景：《现代汉语常用词表》偏书面语/百科，对口语、问候、应答结构收录严重缺失——
+         * 实测「你好/您好/不对/是的/做什么/干什么/什么时候」等全部落空，只能拿到资产平档 50。
+         * 而九键 T9 把 n/m、l/r 并键，「你好」(64426) 与「密函/密告/拟稿/米糕/蜜柑」(同数字)
+         * 完全同键，后者只要被词表收录就拿到 62 档，把「你好」压到候选栏第 6 位。
+         * 这类词靠"补录词表"永远补不完（未收录率 86%），故单开一个口语档兜底。
+         */
+        private const val ASSET_ORAL_BOOST = "oral_boost.txt"
+
         /** 真实词频分级表（词 频级名次）：来自《现代汉语常用词表》5.6 万词（2.5 亿字语料），
          *  名次越小越常用。词组资产平档 50 无区分度，同音组内排序退化为拼音字母序，
          *  生僻词（俵寄/猋急）排在常用词前——按频级分档注入真实常用度 */
@@ -80,6 +90,10 @@ class DictionaryDatabase(private val appContext: Context) :
         /** 用户词保护档：用户打过的词直接跳入此档，压过所有基础档位（手编词 90/单字 85/词组 50），
          *  之后再打则在档内 +1，几次即可稳定置顶 */
         private const val USER_TIER = 95
+
+        /** 口语高频词档：问候/应答/口头结构，高于词频分级最高档 89，低于用户保护档 95。
+         *  必须压过词频分级的头部档（89），否则「你好」这类词仍会被同键生僻词顶下去 */
+        private const val ORAL_TIER = 92
 
         /** 常用词档：精选高频词（如 精简/时间）升至此档，高于资产词组平档 50、低于手编词 90 */
         private const val COMMON_TIER = 88
@@ -127,6 +141,9 @@ class DictionaryDatabase(private val appContext: Context) :
         // 常用单字升档：纠正五档制档位失真（如 要 在自己组排第 14）
         boostCommonChars(db)
 
+        // 口语高频词兜底升档：必须在词频分级之后，补上词表漏收的问候/应答结构
+        applyOralBoost(db)
+
         // 重复词条归一：手编连写拼音与资产分隔拼音同词并存 -> 合并为分隔拼音单条
         normalizeWordDuplicates(db)
 
@@ -172,6 +189,13 @@ class DictionaryDatabase(private val appContext: Context) :
             // 14→15：注入真实词频分级（5.6 万词按《现代汉语常用词表》频级分档）
             if (oldVersion < 15) {
                 applyWordFreqTiers(db)
+            }
+            // 15→16：口语高频词升档（修复「你好」被同键生僻词压到候选栏第 6 位）
+            // + 重跑词频分级（tierForRank 由 5 档细化到 8 档，存量用户需要重新分档才能拿到分辨率）。
+            // 两步均幂等且仅升不降，重跑安全
+            if (oldVersion < 16) {
+                applyWordFreqTiers(db)
+                applyOralBoost(db)
             }
         } else {
             db.execSQL("DROP TABLE IF EXISTS $TABLE_WORDS")
@@ -1026,13 +1050,18 @@ class DictionaryDatabase(private val appContext: Context) :
         return null
     }
 
-    /** 按拼音提升词频（用户选词学习）。异步执行 + pinyin 索引，不阻塞主线程。
-     *  用户词保护档：词频低于 USER_TIER 时直接跳档（一次上屏即可置顶），已入档则继续 +1 */
-    fun incrementFrequency(pinyin: String) {
+    /**
+     * 按拼音+词条提升词频（用户选词学习）。异步执行 + pinyin 索引，不阻塞主线程。
+     * 用户词保护档：词频低于 USER_TIER 时直接跳档（一次上屏即可置顶），已入档则继续 +1。
+     *
+     * word 条件不可省：九键并键导致大量同音异义词（你好/昵好 同为 ni'hao），
+     * 只按 pinyin 更新会把用户没选中的同音词一起抬进保护档，「昵好」从此永久霸占候选首位。
+     */
+    fun incrementFrequency(pinyin: String, word: String) {
         ioScope.launch {
             writableDatabase.execSQL(
-                "UPDATE $TABLE_WORDS SET $COL_FREQ = CASE WHEN $COL_FREQ < $USER_TIER THEN $USER_TIER ELSE $COL_FREQ + 1 END WHERE $COL_PINYIN = ?",
-                arrayOf(pinyin)
+                "UPDATE $TABLE_WORDS SET $COL_FREQ = CASE WHEN $COL_FREQ < $USER_TIER THEN $USER_TIER ELSE $COL_FREQ + 1 END WHERE $COL_PINYIN = ? AND $COL_WORD = ?",
+                arrayOf(pinyin, word)
             )
         }
     }
@@ -1082,12 +1111,21 @@ class DictionaryDatabase(private val appContext: Context) :
         }
     }
 
-    /** 频级名次 -> 词频档位：前 2000 名 88，逐档递减，榜内保底 62（高于资产平档 50） */
+    /**
+     * 频级名次 -> 词频档位。
+     * 旧版只分 5 档（88/84/78/70/62），5.5 万词挤进 5 个离散值：同音组内大量常用词并列，
+     * 排序最终退化成入库顺序（不可预测，「你好」被同档生僻词挤到第 6 就是这种"平局"造成的）。
+     * 改成 8 档并压缩头部区间（1000 名以内拉开 3 档），让常用区有真实分辨率。
+     * 头部上限压在 89 而非 90/88，避免撞上手编词 90 与常用词 88 两个既有档位。
+     */
     private fun tierForRank(rank: Int): Int = when {
-        rank <= 2000 -> 88
-        rank <= 8000 -> 84
-        rank <= 20000 -> 78
-        rank <= 40000 -> 70
+        rank <= 1000 -> 89
+        rank <= 3000 -> 86
+        rank <= 8000 -> 83
+        rank <= 15000 -> 79
+        rank <= 25000 -> 74
+        rank <= 35000 -> 70
+        rank <= 45000 -> 65
         else -> 62
     }
 
@@ -1182,6 +1220,37 @@ class DictionaryDatabase(private val appContext: Context) :
                 update.bindLong(1, freq.toLong())
                 update.bindString(2, parts[0])
                 update.bindLong(3, freq.toLong())
+                update.executeUpdateDelete()
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+            update.close()
+        }
+    }
+
+    /**
+     * 口语高频词升档：把 oral_boost.txt 里的问候/应答/口头结构提到 ORAL_TIER。
+     * 仅升不降（词频已 >= ORAL_TIER 的不动，保护用户学习成果）。
+     * 必须在 applyWordFreqTiers 之后执行——先用真实词频分档，再用口语档兜底补漏，
+     * 这样「你好」这类词表漏收的也能拿到 92，压过同键的 62 档生僻词。
+     */
+    private fun applyOralBoost(db: SQLiteDatabase) {
+        val lines = try {
+            appContext.assets.open(ASSET_ORAL_BOOST).bufferedReader().use { it.readLines() }
+        } catch (e: Exception) {
+            return
+        }
+        val update = db.compileStatement(
+            "UPDATE $TABLE_WORDS SET $COL_FREQ = $ORAL_TIER WHERE $COL_PINYIN = ? AND $COL_WORD = ? AND $COL_FREQ < $ORAL_TIER"
+        )
+        db.beginTransaction()
+        try {
+            for (line in lines) {
+                val parts = line.split(' ')
+                if (parts.size != 2) continue
+                update.bindString(1, parts[0])
+                update.bindString(2, parts[1])
                 update.executeUpdateDelete()
             }
             db.setTransactionSuccessful()
