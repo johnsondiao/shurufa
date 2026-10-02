@@ -36,7 +36,15 @@ import unicodedata
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DEFAULT_DB = os.path.join(ROOT, "_data", "test_dict.db")
+# 默认评**真正打包进 APK 的那一份**词库，而不是任何中间产物。
+#
+# 这里曾经指向 _data/test_dict.db —— 那是改版前的 v16 遗留库（words/frequency 表、
+# 411715 条、9 月的产物）。后果很隐蔽：不带 --db 直接跑，得到的是 57.7% 这种
+# 毫无意义的数字，而人会以为"当前水平就这样"，进而对着错误基线调参。
+# 评测对象必须只有一个真身：assets 里那份会被设备解包的库。
+DEFAULT_DB = os.path.join(ROOT, "PersonalIME", "PersonalIME", "app",
+                          "src", "main", "assets", "dict", "base_words.db")
+# v16 遗留库仍在 _data/test_dict.db，需要做历史对照时显式传 --db。
 PINYIN_DATA = os.path.join(ROOT, "_data", "phrase-pinyin-data", "large_pinyin.txt")
 CHAR_DATA = os.path.join(ROOT, "_data", "pinyin-data", "kMandarin_8105.txt")
 
@@ -50,6 +58,22 @@ for _letters, _digit in [
         LETTER_TO_DIGIT[_ch] = _digit
 
 CJK_LO, CJK_HI = 0x4E00, 0x9FFF
+
+
+def rel_to_root(path):
+    """
+    相对 ROOT 的展示用路径。跨盘符时原样返回。
+
+    为什么需要这个包装：Windows 上 `os.path.relpath()` 在**不同盘符**之间会抛
+    ValueError（不存在公共前缀）。而 `--out` 的报告是在所有计算之后、逐行写出去的，
+    一旦抛异常，报告文件就只剩最上面那个标题 —— 而且因为异常发生在"打完了"之后，
+    很容易被当成"报告就很短"而忽略。实测：把临时库放在 C: 盘、仓库在 D: 盘时，
+    报告只剩 42 字节。所以这里必须兜住，宁可显示绝对路径也不能中断写出。
+    """
+    try:
+        return os.path.relpath(path, ROOT)
+    except ValueError:
+        return path
 
 
 def to_digits(pinyin: str) -> str:
@@ -489,8 +513,8 @@ def main():
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             f.write("# PersonalIME 排序质量评测报告\n\n")
-            f.write(f"- 数据库：`{os.path.relpath(args.db, ROOT)}`（{total_rows} 条）\n")
-            f.write(f"- 语料：`{os.path.relpath(args.corpus, ROOT)}`"
+            f.write(f"- 数据库：`{rel_to_root(args.db)}`（{total_rows} 条）\n")
+            f.write(f"- 语料：`{rel_to_root(args.corpus)}`"
                     f"（词条 {len(words)} 条 / 组合串 {len(phrases)} 条）\n\n")
             for title, overall, by_prio, by_dom in report:
                 f.write(f"## {title}\n\n{HEADER}\n{fmt_row(overall)}\n\n")

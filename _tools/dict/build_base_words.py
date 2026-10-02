@@ -85,6 +85,13 @@ CONFIG = {
     # 字符级回退权重：无任何语料证据的词只能拿到 λ 份的字符模型概率。
     # 越小 => 无证据词被压得越低（但现代新词也越难进来，所以靠 oral/THUOCL 补）。
     "lambda_oov": 0.02,
+    # ── 阶段 4c：字符 bigram 链修正（0 = 关闭，与旧行为逐比特相同）
+    # 加在 P_char 上，表达"这个字串本身顺不顺"。见 CharBigram / char_model_logp。
+    # 取值 1.0 = PMI 项全额计入（不是凑出来的数：实测 μ∈[0.5,1.5] 是指标平台，
+    # 两端单调回落——μ=2.0 掉到 85.6%，μ=3.0 崩到 79.9%；1.0 是平台中心）。
+    "oov_chain_mu": 1.0,
+    # 链模型文件：与设备端 LanguageModel 复用同一份（见 CharBigram 的"为什么读它"）
+    "oov_chain_db": os.path.join(HERE, "..", "lm", "bigram.db"),
     # 未知字符的概率下限（生僻汉字）
     "char_prob_floor": 1e-7,
     # 裁剪规则（治本"生僻词霸榜"）：
@@ -323,6 +330,29 @@ def char_logp(word, char_prob):
     return total
 
 
+def char_model_logp(word, char_prob, chain=None):
+    """
+    字符模型 log P_char(w)（阶段 4c）。
+
+        基础项  = Σ ln p_char(c_i)                字符 unigram 连乘（阶 0）
+        链修正  = μ · Σ PMI(c_{i-1}→c_i)          字符 bigram 链（阶 1），点互信息形式
+
+    为什么要加链：unigram 连乘对**词内邻接**完全不敏感。「保温杯」和「保温北」只要
+    各字字频相近就得分相同，于是长尾词的内部顺序基本是随机的。真实输入法在这里用
+    「这个字串本身顺不顺」来判——也就是字符 bigram。
+
+    为什么是 PMI 而不是"减全局均值"：见 CharBigram.pmi_sum，后者会删掉 42% 的词库。
+
+    为什么用可调的 μ 而不是直接换成链概率：μ=0 严格退化为旧行为，可以逐个 μ 做消融，
+    且不动 prune_logp / mean_char_floor 的绝对标定，改动可归因、可回滚。
+    """
+    lp = char_logp(word, char_prob)
+    mu = CONFIG.get("oov_chain_mu", 0.0)
+    if chain is not None and mu > 0.0 and len(word) > 1:
+        lp += mu * chain.pmi_sum(word)
+    return lp
+
+
 def single_char_logp(ch, char_prob, corpus_logp):
     """
     单字概率 = 该字在语料中的字频（char_freq.csv，5707 字实测）。
@@ -333,6 +363,109 @@ def single_char_logp(ch, char_prob, corpus_logp):
     lp = math.log(p) if p and p > 0 else math.log(CONFIG["char_prob_floor"])
     other = corpus_logp.get(ch)
     return max(lp, other) if other is not None else lp
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 字符 bigram 链（阶段 4c）：读 _tools/lm/bigram.db
+# ─────────────────────────────────────────────────────────────────────────────
+class CharBigram:
+    """
+    离线只读的字符 bigram，与设备端 LanguageModel 是**同一个模型文件**。
+
+    为什么要读它而不是重新训练：设备端整句打分用的就是这份表，
+    词库构建若另起一份，两边对"什么字串顺"的判断会不一致，
+    于是出现"整句路径觉得顺、词条先验觉得差"的自相矛盾排序。
+
+    退避与设备端**逐比特一致**：未保留的 (a,b) 用
+        ln P_uni(b) + ln(δ/(c(a)+δ))
+    两项分别来自 char_uni 的 logp / norm 列，是精确退避而非近似。
+    """
+
+    def __init__(self, path):
+        self.ok = False
+        self.mean = 0
+        self.bi = {}
+        self.uni = {}
+        self.floor = -100_000
+        if not path or not os.path.exists(path):
+            return
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            for k, v in con.execute("SELECT key, value FROM lm_meta"):
+                if k == "mean_logp":
+                    self.mean = int(v)
+            min_lp = min_nm = None
+            for cp, lp, nm in con.execute("SELECT cp, logp, norm FROM char_uni"):
+                self.uni[cp] = (lp, nm)
+                if min_lp is None or lp < min_lp:
+                    min_lp = lp
+                if min_nm is None or nm < min_nm:
+                    min_nm = nm
+            for prev, nxt, lp in con.execute("SELECT prev, next, logp FROM bigram"):
+                self.bi[(prev, nxt)] = lp
+        finally:
+            con.close()
+        if min_lp is not None and min_nm is not None:
+            # 与 Kotlin LanguageModel.floorScore 同式：最罕见后字 × 最常见前字
+            self.floor = min_lp + min_nm
+        self.ok = bool(self.uni)
+        print(f"   字符 bigram：{len(self.bi)} 条 ｜ unigram {len(self.uni)} 字 ｜ "
+              f"mean_logp={self.mean}")
+
+    def raw(self, a, b):
+        """未中心化的 ln P(b|a)，单位毫纳特。前字不在字符集时返回 None（= 无信息）"""
+        v = self.bi.get((ord(a), ord(b)))
+        if v is not None:
+            return v
+        nxt = self.uni.get(ord(b))
+        if nxt is None:
+            return self.floor          # 后字几乎不出现：强稀有证据，给下限
+        prv = self.uni.get(ord(a))
+        if prv is None:
+            return None
+        return nxt[0] + prv[1]
+
+    def centered_sum(self, word):
+        """
+        Σ[raw(a→b) − mean_logp]，转成纳特。
+        **已弃用**——见 pmi_sum 的说明，保留只为对照实验。
+        """
+        total = 0
+        for a, b in zip(word, word[1:]):
+            r = self.raw(a, b)
+            if r is not None:
+                total += r - self.mean
+        return total / 1000.0
+
+    def pmi_sum(self, word):
+        """
+        Σ[ln P(b|a) − ln P_uni(b)]，转成纳特 —— 逐边界的**点互信息**。
+
+        为什么不能用"减语料全局均值"（centered_sum）来中心化：
+        全局均值是一个常数，减完之后每个边界仍带一个随字数线性累积的负偏移，
+        于是长词被系统性压低。实测 μ=1.0 时词库从 387593 条掉到 223514 条
+        （**删掉了 42% 的词**）——因为被压到 prune_logp 之下的词直接出局了。
+        这与"补全词库"的目标正好相反。
+
+        PMI 形式没有这个问题：在真实条件分布下
+        Σ_b P(b|a)·ln[P(b|a)/P_uni(b)] = KL(P(·|a) ‖ P_uni) ≥ 0 且逐前字近似抵消，
+        所以它不会给整条长尾一个单向漂移。它衡量的也正是我们想要的东西——
+        「这两个字凑在一起，比它们各自按自身频率偶然相邻更可信多少」，
+        这就是搭配抽取里的经典判据。
+
+        退避边界（未保留的 (a,b)）代入 P(b|a)=P_uni(b)·δ/(c(a)+δ) 后，
+        该项恰为 ln(δ/(c(a)+δ))，即"前字本身很罕见"，与设备端 LanguageModel
+        的退避口径一致。
+        """
+        total = 0
+        for a, b in zip(word, word[1:]):
+            r = self.raw(a, b)
+            if r is None:
+                continue
+            u = self.uni.get(ord(b))
+            if u is not None:
+                total += r - u[0]
+        return total / 1000.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -448,7 +581,7 @@ def src_cn_words():
 # ─────────────────────────────────────────────────────────────────────────────
 # logp 计算
 # ─────────────────────────────────────────────────────────────────────────────
-def build_logp(sources, char_prob):
+def build_logp(sources, char_prob, chain=None):
     """
     sources: {source_name: [word by rank]} —— 域内词表按 Zipf 折算后加权混合
     返回 word -> logp
@@ -489,9 +622,14 @@ def build_logp(sources, char_prob):
     return logp
 
 
-def oov_logp(word, char_prob):
-    """无任何语料证据的词：只有字符模型那一份"""
-    return math.log(CONFIG["lambda_oov"]) + char_logp(word, char_prob)
+def oov_logp(word, char_prob, chain=None):
+    """
+    无任何语料证据的词：只有字符模型那一份。
+
+    chain 非空时叠加字符 bigram 链修正（阶段 4c）。注意这里返回的是**入库分数**，
+    不是裁剪判据——裁剪用的是不带链的 unigram 分，见 build() 里的说明。
+    """
+    return math.log(CONFIG["lambda_oov"]) + char_model_logp(word, char_prob, chain)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -506,6 +644,13 @@ def build(out_db, report_path, report_only=False):
     print(f"   单字读音表 {len(ann.chars)} 字 ｜ 词组拼音表 {len(ann.phrases)} 条")
     char_prob = load_char_prob()
     print(f"   字符频率表 {len(char_prob)} 字")
+    # 阶段 4c：只在 μ>0 时才加载链模型（加载要读 13 万行，不白花时间）
+    chain = None
+    if CONFIG.get("oov_chain_mu", 0.0) > 0.0:
+        chain = CharBigram(CONFIG.get("oov_chain_db"))
+        if not chain.ok:
+            print("   [警告] 字符 bigram 不可用，oov_chain_mu 被忽略（回退到纯 unigram）")
+            chain = None
 
     print("\n② 采集证据源 …")
     sources = {
@@ -562,17 +707,27 @@ def build(out_db, report_path, report_only=False):
         lp = logp.get(w)
         attested = lp is not None
         if not attested:
-            lp = oov_logp(w, char_prob)
+            # 裁剪判据用**不带链**的 unigram 分。
+            # 为什么必须分开：prune_logp=-26 是按 unigram 尺度标定的绝对阈值。
+            # 链修正会把罕用字开头的词整体推低（退避项 ln(δ/(c(a)+δ)) 本身就很负），
+            # 若让裁剪看带链的分数，μ 一开就会把词库砍掉 -9.8%…-42.3% 的词——
+            # 这与"补全词库"的目标正好相反，而且会让 μ 同时控制"砍多少词"和"怎么排序"，
+            # 无法归因。这里把两件事彻底分开：**是否收录**只看 unigram，**排序**才看链。
+            lp_uni = oov_logp(w, char_prob, None)
             stat["无证据"] += 1
+        else:
+            lp_uni = lp
         # 裁剪：无证据 且 整体由生僻字构成 -> 裁掉（现代词有 oral/THUOCL/modern 兜）
         if not attested and mean_char_prob(w) < CONFIG["mean_char_floor"]:
-            pruned.append((w, lp))
+            pruned.append((w, lp_uni))
             stat["裁：由生僻字构成"] += 1
             continue
-        if lp < CONFIG["prune_logp"]:
-            pruned.append((w, lp))
+        if lp_uni < CONFIG["prune_logp"]:
+            pruned.append((w, lp_uni))
             stat["裁：低于绝对下限"] += 1
             continue
+        # 通过收录判据后，才把链修正加进入库分数（只影响同数字组内的先后）
+        lp = oov_logp(w, char_prob, chain) if not attested else lp
         py, whole = ann.annotate(w)
         if not py:
             stat["注音失败"] += 1
@@ -720,6 +875,7 @@ def build(out_db, report_path, report_only=False):
         ("mean_char_floor", str(CONFIG["mean_char_floor"])),
         ("prune_logp", str(CONFIG["prune_logp"])),
         ("lambda_oov", str(CONFIG["lambda_oov"])),
+        ("oov_chain_mu", str(CONFIG.get("oov_chain_mu", 0.0))),
     ])
     c.execute("COMMIT")
     c.execute("VACUUM")
@@ -741,10 +897,15 @@ def build(out_db, report_path, report_only=False):
         with open(report_path, "w", encoding="utf-8") as f:
             f.write("# 词库构建报告\n\n")
             f.write(f"- 输出：`{out_label}`，**{n}** 条，{size:.1f} MB\n")
-            f.write(f"- 裁剪阈值 logp < {CONFIG['prune_logp']}（裁掉 {len(pruned)} 条生僻词）\n")
-            f.write(f"- λ(oov) = {CONFIG['lambda_oov']}\n\n")
+            f.write(f"- 裁剪阈值 logp < {CONFIG['prune_logp']}"
+                    f"（裁掉 {len(pruned)} 条生僻词；**判据用不带字符链的 unigram 分**，"
+                    f"故词库规模与 oov_chain_mu 无关）\n")
+            f.write(f"- λ(oov) = {CONFIG['lambda_oov']}\n")
+            mu = CONFIG.get("oov_chain_mu", 0.0)
+            f.write(f"- 字符 bigram 链（阶段 4c）：oov_chain_mu = {mu}"
+                    f"{'（关闭，无证据词只用字符 unigram 连乘）' if mu <= 0 else ''}\n\n")
             f.write("## 词源\n\n| 源 | 条数 | 权重 |\n|---|---|---|\n")
-            for name in ("word_freq", "oral", "modern", "common_boost"):
+            for name in ("word_freq", "oral", "modern", "common_boost", "structured"):
                 f.write(f"| {name} | {len(sources[name])} | "
                         f"{CONFIG['sources'][name]['weight']} |\n")
             for d, ws in sources["thuocl"].items():

@@ -191,8 +191,71 @@ class DictionaryDatabase(private val appContext: Context) :
         db().rawQuery(sql, arrayOf(prefix + "*", prefix, limit.toString())).use { c ->
             while (c.moveToNext()) out.add(c.toEntry())
         }
-        mergeUserWords(out, prefix)
+        // 这里**不能**用 mergeUserWords：那个函数按 `digits GLOB` 匹配，
+        // 而本函数的匹配键是**词前缀**。历史上就是传了 prefix 进去，
+        // 于是 `digits GLOB '中国*'` 永远匹配不上任何数字串——
+        // 结果是"用户添加的词"和"学过的高频联想词"在联想列表里全部静默失效。
+        mergeUserDataByWordPrefix(out, prefix)
         return out.sortedByDescending { it.score }.take(limit)
+    }
+
+    /**
+     * 联想列表的用户数据合并：用户主动添加的词条 + 用户偏好加成。
+     * 匹配键是**词前缀**（`word GLOB prefix*`），不是数字串。
+     */
+    private fun mergeUserDataByWordPrefix(out: MutableList<WordEntry>, prefix: String) {
+        val database = db()
+        val now = System.currentTimeMillis() / 1000L
+        val glob = prefix + "*"
+
+        val byWord = HashMap<String, WordEntry>()
+        for (e in out) byWord[e.word] = e
+
+        // 1) 用户主动添加的词：不衰减，直接给高分（可能不在 base 里，故从 user_words 取）
+        database.rawQuery(
+            "SELECT $COL_WORD, $COL_PINYIN, $COL_LOGP FROM $TABLE_USER_WORDS WHERE $COL_WORD GLOB ?",
+            arrayOf(glob)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val w = c.getString(0)
+                val e = WordEntry(w, c.getString(1), c.getInt(2), 0)
+                val prev = byWord[w]
+                if (prev == null || e.score > prev.score) byWord[w] = e
+            }
+        }
+
+        // 2) 用户偏好：同样按词前缀取，命中者从 base 补回条目再加成
+        val prefSet = HashSet<String>()
+        database.rawQuery(
+            "SELECT key, cnt, t_last FROM $TABLE_USER_PREF WHERE scope = ? AND key GLOB ?",
+            arrayOf(SCOPE_WORD, glob)
+        ).use { c ->
+            // 与 appendPreferredWords 同一考虑：下面要用 key IN (?,…) 拼语句，必须封顶
+            while (c.moveToNext() && prefSet.size < PREF_FETCH_MAX) {
+                if (preferenceWeight(c.getLong(1), c.getLong(2), now) >= PREF_MIN_WEIGHT) {
+                    prefSet.add(c.getString(0))
+                }
+            }
+        }
+        if (prefSet.isNotEmpty()) {
+            val marks = prefSet.joinToString(",") { "?" }
+            database.rawQuery(
+                "SELECT $COL_WORD, $COL_PINYIN, $COL_LOGP, $COL_FLAGS " +
+                    "FROM ${BaseDictionary.ALIAS}.${BaseDictionary.TABLE} WHERE $COL_WORD IN ($marks)",
+                prefSet.toTypedArray()
+            ).use { c ->
+                while (c.moveToNext()) {
+                    val e = c.toEntry()
+                    val prev = byWord[e.word]
+                    if (prev == null || e.score > prev.score) byWord[e.word] = e
+                }
+            }
+        }
+
+        out.clear()
+        out.addAll(byWord.values.map { e ->
+            if (e.word in prefSet) e.copy(score = e.score + PREF_DOMINANCE) else e
+        })
     }
 
     /**
@@ -249,8 +312,53 @@ class DictionaryDatabase(private val appContext: Context) :
         db().rawQuery(sql, args + limit.toString()).use { c ->
             while (c.moveToNext()) out.add(c.toEntry())
         }
+        // 必须放在 mergeUserWords **之前**：偏好词的基础条目可能压根不在这 limit 条里，
+        // 补进来之后 mergeUserWords 才有东西可加成。见 [appendPreferredWords]。
+        appendPreferredWords(out, digits)
         mergeUserWords(out, digits)
         return out.sortedByDescending { it.score }.take(limit)
+    }
+
+    /**
+     * 把本数字组里"用户偏好过、但没进基础查询结果"的词条补进候选集。
+     *
+     * ## 为什么必须有这一步
+     * 基础查询是 `ORDER BY logp DESC LIMIT ?`，**先截断**；而偏好加成在内存里做
+     * （[mergeUserWords] 的注释解释了为什么不能写进 SQL 的 ORDER BY）。
+     * 两者一叠加就出问题：如果用户偏好了一个基础分排在第 200 位的词，
+     * 而窗口只有 60 条，这个词根本不在 [out] 里，`byWord[e.word]` 找不到它，
+     * 加成无处可加 —— 表现就是「我明明选过它，可它再也排不上来」。
+     *
+     * 窗口越小越明显：整句候选给每个子串的窗口只有 WORDS_PER_SUB=6 条。
+     *
+     * ## 代价
+     * 多一次 `user_pref` 查询；只有真的存在偏好词（且不在窗口内）时才再查一次 base。
+     * 无偏好时是空结果，热路径上只多一条索引查询。上限 [PREF_FETCH_MAX] 防止
+     * 偏好词过多时拼出超长 IN 子句。
+     */
+    private fun appendPreferredWords(out: MutableList<WordEntry>, digitsPattern: String) {
+        val likeArg = if (digitsPattern.endsWith("*")) digitsPattern else "$digitsPattern*"
+        val have = HashSet<String>(out.size * 2 + 8)
+        for (e in out) have.add(e.word)
+        val missing = ArrayList<String>()
+        db().rawQuery(
+            "SELECT key FROM $TABLE_USER_PREF WHERE scope = ? AND $COL_DIGITS GLOB ?",
+            arrayOf(SCOPE_WORD, likeArg)
+        ).use { c ->
+            while (c.moveToNext() && missing.size < PREF_FETCH_MAX) {
+                val w = c.getString(0)
+                if (have.add(w)) missing.add(w)
+            }
+        }
+        if (missing.isEmpty()) return
+        val marks = missing.joinToString(",") { "?" }
+        db().rawQuery(
+            "SELECT $COL_WORD, $COL_PINYIN, $COL_LOGP, $COL_FLAGS " +
+                "FROM ${BaseDictionary.ALIAS}.${BaseDictionary.TABLE} WHERE $COL_WORD IN ($marks)",
+            missing.toTypedArray()
+        ).use { c ->
+            while (c.moveToNext()) out.add(c.toEntry())
+        }
     }
 
     /**
@@ -397,6 +505,15 @@ class DictionaryDatabase(private val appContext: Context) :
          * 这是"随使用越来越懂你"的实现方式，而衰减负责让它自然退场。
          */
         private const val PREF_DOMINANCE = 40000
+
+        /**
+         * 一次最多补回多少个"窗口外"的偏好词。
+         *
+         * 存在的理由：偏好词的条目要用 `word IN (?,?,…)` 拼一条 SQL 去 base 取回，
+         * 数量必须封顶，否则一个被大量使用过的数字组会拼出超长语句。
+         * 32 远大于任何单个数字组的合理偏好词数（同音组通常个位数）。
+         */
+        private const val PREF_FETCH_MAX = 32
 
         /** 偏好权重阈值（纳特）：低于此值视为已遗忘 */
         private const val PREF_MIN_WEIGHT = 0.15
