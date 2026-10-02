@@ -7,3 +7,5 @@ lm/corpus/
 
 # 杂项
 _debug*.txt
+__pycache__/
+*.pyc

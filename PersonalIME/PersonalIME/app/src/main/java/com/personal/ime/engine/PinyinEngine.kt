@@ -72,7 +72,7 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         "za", "zai", "zan", "zang", "zao", "ze", "zei", "zen", "zeng", "zha", "zhai", "zhan", "zhang", "zhao", "zhe", "zhei", "zhen", "zheng", "zhi", "zhong", "zhou", "zhu", "zhua", "zhuai", "zhuan", "zhuang", "zhui", "zhun", "zhuo", "zi", "zong", "zou", "zu", "zuan", "zui", "zun", "zuo"
     )
 
-    fun inputT9(digits: String): List<Candidate> {
+    fun inputT9(digits: String, context: Char? = null): List<Candidate> {
         if (digits.isEmpty()) return emptyList()
         // 词库尚未完成安装/挂载时由调用方展示提示，这里直接返回空避免阻塞主线程
         if (!database.isReady) return emptyList()
@@ -123,7 +123,11 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         absorb(database.queryPrefix(plain, CONTINUE_LIMIT), 2)
 
         return merged.entries
-            .map { Candidate(it.key, it.value.first, it.value.second, emptyList(), it.value.third) }
+            .map {
+                // 阶段 4a：同一个数字串里该先出哪个词，取决于前文（见 contextBonus）
+                Candidate(it.key, it.value.first + contextBonus(context, it.key.firstOrNull()),
+                          it.value.second, emptyList(), it.value.third)
+            }
             .sortedWith(
                 // 匹配层级升序（打完的词置顶）；层内分数降序；同分短词优先
                 compareBy<Candidate> { c -> merged[c.text]?.third ?: 2 }
@@ -152,7 +156,7 @@ class PinyinEngine(private val database: DictionaryDatabase) {
      *
      * 不同切分覆盖同一串数字，因此分数可直接比较——这也是能启用 bigram 的前提。
      */
-    fun sentenceCandidates(digits: String, limit: Int = 3): List<Candidate> {
+    fun sentenceCandidates(digits: String, limit: Int = 3, context: Char? = null): List<Candidate> {
         // 分词键（'）切出强制音节边界：整句切分的词边界必须落在这些位置上
         val boundaries = mutableListOf<Int>()
         var acc = 0
@@ -191,7 +195,10 @@ class PinyinEngine(private val database: DictionaryDatabase) {
                     for (w in words) {
                         if (w.word.none { it in '\u4E00'..'\u9FFF' }) continue
                         var add = w.score
-                        if (!isFirst) {
+                        if (isFirst) {
+                            // 首词的左邻是"上文"（上一个上屏词的末字），不是本串内的词
+                            add += contextBonus(context, w.word.firstOrNull())
+                        } else {
                             add -= LM_SEG_PENALTY
                             // 语言模型未就绪时返回 null：跳过该项，视为"无上下文信息"
                             database.bigramScore(prev.text.last(), w.word.first())?.let {
@@ -229,7 +236,8 @@ class PinyinEngine(private val database: DictionaryDatabase) {
      * 用户选了某个读法后的输入：拼音过滤下推到 DB 精确查询，
      * 避免只在内存小窗口内过滤导致该读法的字被窗口截断（如 94 选 yi 后 意/易 打不出）。
      */
-    fun inputT9ByPinyin(digits: String, selected: String, limit: Int = 60): List<Candidate> {
+    fun inputT9ByPinyin(digits: String, selected: String, limit: Int = 60,
+                        context: Char? = null): List<Candidate> {
         if (digits.isEmpty() || !database.isReady) return emptyList()
         val boundaries = mutableListOf<Int>()
         var acc = 0
@@ -260,13 +268,35 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         absorb(database.queryPrefix(plain, CONTINUE_LIMIT), 2)
 
         return merged.entries
-            .map { Candidate(it.key, it.value.first, it.value.second, emptyList(), it.value.third) }
+            .map {
+                Candidate(it.key, it.value.first + contextBonus(context, it.key.firstOrNull()),
+                          it.value.second, emptyList(), it.value.third)
+            }
             .sortedWith(
                 compareBy<Candidate> { c -> merged[c.text]?.third ?: 2 }
                     .thenByDescending { it.score }
                     .thenBy { it.text.length }
             )
             .take(limit)
+    }
+
+    /**
+     * 阶段 4a：上下文加成。分数 = β_ctx · 中心化 bigram(上文末字, 候选首字)。
+     *
+     * 解决的是词频模型**原理上无法解决**的问题：同一个数字串里选哪个字。
+     *   例 9494 = yi'xi / zi'xi / yi'zi …；8426 = tian / tiao。
+     *   这几个字的语料频率本就接近，谁排前面纯看谁在语料里多出现几次——
+     *   可实际答案完全取决于前文：前文是「今」时 8426 必是「天」，是「一」时必是「条」。
+     *
+     * 用中心化后的 bigram（只表达"比平均搭接顺多少"），所以：
+     *   - 不引入长度偏置（见 LanguageModel 的中心化说明）
+     *   - 语言模型未就绪 / 上文为空 / 首字不在字符集 时返回 0，退化为纯词频排序
+     * 语言模型未就绪时返回 0 而不是负值很重要：不能因为"查不到"就惩罚候选。
+     */
+    private fun contextBonus(context: Char?, first: Char?): Int {
+        if (context == null || first == null || first == context) return 0
+        val s = database.bigramScore(context, first) ?: return 0
+        return Math.floorDiv(s * CTX_BETA_PER_MILLE, 1000)
     }
 
     /**
@@ -458,6 +488,19 @@ class PinyinEngine(private val database: DictionaryDatabase) {
          * 再大开始被偶发共现带偏，再小上下文几乎不起作用。
          */
         private const val LM_BETA_PER_MILLE = 600
+
+        /**
+         * 上文权重（×1000，阶段 4a）：候选分数 += β_ctx · 中心化 bigram(上文末字, 候选首字)。
+         *
+         * 比串内 β 大得多是刻意的：串内边界是"同一条输入内部的搭接"，多个候选共享同量级
+         * 的词频差异，上下文只需微调；而候选重排面对的是"同一数字串里几个语料频率本就
+         * 相近的字"（8426 = 天/条/调/挑），词频那一项几乎没有区分力，只能靠上下文定夺。
+         *
+         * 1.6 取自 `_tools/eval/eval_context.py` 的扫描：平台期很宽（1200~2600 都在
+         * Top-1 90%+ 且 Top-3 100%），取平台中段而非饱和点（2000+）——饱和意味着
+         * 上下文已完全压过词频，一旦 bigram 估计偏了就没有兜底。
+         */
+        private const val CTX_BETA_PER_MILLE = 1600
 
         /**
          * 段罚（毫纳特）：每多切一段扣 1.5 纳特，偏向更长（更少段）的切分。

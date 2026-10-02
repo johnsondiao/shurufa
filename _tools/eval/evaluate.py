@@ -165,16 +165,30 @@ class BigramLM:
         con.close()
         self.center = center
         self.mean_logp = int(self.meta.get("mean_logp", "0")) if center else 0
+        # 退避下限：最罕见的后字 × 最常见的前字，即中心化前可能取到的最小值。
+        if self.uni:
+            self.floor_raw = (min(lp for lp, _ in self.uni.values()) +
+                              min(nm for _, nm in self.uni.values()))
+        else:
+            self.floor_raw = -100000
 
     def raw(self, prev_ch, next_ch):
         hit = self.bi.get((ord(prev_ch), ord(next_ch)))
         if hit is not None:
             return hit
         u = self.uni.get(ord(next_ch))
-        if u is None:                 # 后字不在字符集，无信息
-            return None
+        if u is None:
+            # 后字不在 char_uni：这**不是"无信息"**，而是"这个字在 4500 万字语料里
+            # 几乎不出现"，是相当强的稀有证据，必须给退避下限。
+            # 曾经返回 None 被调用方当成 0 分，后果是「未知」压过「已知但搭接差」：
+            # 上文为「后」时打 8426，「蜩/龆/盷」（语料里几乎为零）靠 0 加成，
+            # 反超中心化后为 -11.7 的「天」，直接把「天」挤出候选。
+            return self.floor_raw
         n = self.uni.get(ord(prev_ch))
-        return u[0] + (n[1] if n else 0)
+        if n is None:
+            # 前字不在字符集（拉丁字母/标点当上下文）：真正的"无上下文信息"
+            return None
+        return u[0] + n[1]
 
     def score(self, prev_ch, next_ch):
         v = self.raw(prev_ch, next_ch)
@@ -204,14 +218,18 @@ def detect_schema(db):
 
 # ---------------------------------------------------------------- 引擎路径复现
 
-def simulate_input_t9(db, digits, candidate_limit=60):
+def simulate_input_t9(db, digits, candidate_limit=60, lm=None, ctx=None, ctx_beta=1000):
     """
     复现 PinyinEngine.inputT9()：
       1) 恰好打完（digits 相等，LIMIT 60，tier 0）
       2) 若 (1) 无结果：从长到短找已完整输入的最长前缀（LIMIT 16），首个非空即用，tier 1
       3) 续打（digits 前缀 GLOB，LIMIT 96，tier 2）
-    排序键：(matchTier 升序, 词频/logp 降序, 词长 升序)，取前 60。
+    排序键：(matchTier 升序, 分数降序, 词长 升序)，取前 60。
     语料拼音不带强制边界符，故 matchesBoundaries 恒真，略去。
+
+    ctx / ctx_beta：上一个上屏文本的末字 + 其权重。
+    候选分数 += ctx_beta · 中心化 bigram(ctx, 候选首字)。
+    这是"阶段 4a 候选级重排"——同一个数字串里哪个字更该出现，取决于前文。
     """
     cur = db.cursor()
     t, s, o = SCHEMA["table"], SCHEMA["score"], SCHEMA["order"]
@@ -220,6 +238,14 @@ def simulate_input_t9(db, digits, candidate_limit=60):
     def fetch(sql, args, limit):
         cur.execute(sql, args + (limit,))
         return [r for r in cur.fetchall() if has_cjk(r[0])]
+
+    def ctx_bonus(word):
+        if ctx is None or lm is None or not word:
+            return 0
+        bs = lm.score(ctx, word[0])
+        if bs is None:
+            return 0
+        return int(ctx_beta * bs) // 1000      # 与 Kotlin Math.floorDiv 对齐
 
     exact = fetch(f"SELECT word, pinyin, {s} FROM {t} WHERE digits=? "
                   f"ORDER BY {o} LIMIT ?", (digits,), candidate_limit)
@@ -242,12 +268,13 @@ def simulate_input_t9(db, digits, candidate_limit=60):
         if word not in merged:
             merged[word] = (score, 2)
 
-    ordered = sorted(merged.items(), key=lambda kv: (kv[1][1], -kv[1][0], len(kv[0])))
+    ordered = sorted(merged.items(),
+                     key=lambda kv: (kv[1][1], -(kv[1][0] + ctx_bonus(kv[0])), len(kv[0])))
     return [w for w, _ in ordered[:candidate_limit]]
 
 
 def simulate_sentence_candidates(db, digits, limit=3, lm=None, beta=1000, sent_k=3,
-                                 seg_penalty=0):
+                                 seg_penalty=0, ctx=None, ctx_beta=1000):
     """
     复现 PinyinEngine.sentenceCandidates()：
       含数字串切分为词库词条组合（覆盖全部输入），DP 保留每位置 K 条路径。
@@ -285,12 +312,18 @@ def simulate_sentence_candidates(db, digits, limit=3, lm=None, beta=1000, sent_k
                 for w, f in ws:
                     # logp 已是整数毫纳特，直接累加即可；旧整数档位原样累加
                     add = int(f)
-                    if j > 0:
+                    if j == 0:
+                        # 首词：左邻是"上文"（上一个上屏词的末字），不是本串内的词
+                        if ctx is not None and lm is not None:
+                            bs = lm.score(ctx, w[0])
+                            if bs is not None:
+                                add += int(ctx_beta * bs) // 1000
+                    else:
                         add -= seg_penalty
-                    if lm is not None and text:
-                        bs = lm.score(text[-1], w[0])
-                        if bs is not None:
-                            add += int(beta * bs) // 1000
+                        if lm is not None:
+                            bs = lm.score(text[-1], w[0])
+                            if bs is not None:
+                                add += int(beta * bs) // 1000
                     paths.append((segs + 1, score + add, text + w))
         if is_logp:
             # 概率量纲：路径总分越高（越接近 0）越优；同分取段数少者（倾向整词）

@@ -31,6 +31,7 @@ PersonalIME 词库构建流水线（阶段 1）
 
 import argparse
 import csv
+import hashlib
 import io
 import math
 import os
@@ -68,6 +69,18 @@ CONFIG = {
         "modern":       {"weight": 0.16, "k": 5},
         "common_boost": {"weight": 0.10, "k": 5},
         "thuocl":       {"weight": 0.06, "k": 50},   # 每个领域各一份，均分该权重
+        # structured 是"净增"权重（Σweight 因此为 1.05，不再等于 1）：
+        # 实测把现有 5 个源等比缩放来腾出权重，会让 Top-1 掉 0.6 个百分点——
+        # 因为那几个源之间的相对关系是调过的，任何缩放都是无谓扰动。
+        # mix 不进 softmax 归一，多出来的这一点只等于给"有证据的词"整体涨一点点，
+        # 而结构化组合词的收益远大于此。
+        #
+        # weight 只能给 0.05，不能更高：Zipf 是按**表内序位**归一化的，
+        # 表越短每个词分到的份额越大。structured 只有 ~150 词，0.10 时表尾的
+        # 「八年」竟能压过「报告」（-8.21 vs -8.46）——因为 150 词的 1/120 份额
+        # 和 5.6 万词表的 1/121 份额只差一个 weight。0.05 后表尾落到 -9.1，
+        # 回到"补盲区"而不是"造新霸榜"。
+        "structured":   {"weight": 0.05, "k": 4},
     },
     # 字符级回退权重：无任何语料证据的词只能拿到 λ 份的字符模型概率。
     # 越小 => 无证据词被压得越低（但现代新词也越难进来，所以靠 oral/THUOCL 补）。
@@ -84,6 +97,10 @@ CONFIG = {
     "mean_char_floor": 3e-5,
     # 兜底绝对下限：无论含什么字，logp 低于此值一律不收录
     "prune_logp": -26.0,
+    # 异读变体的降权（纳特）。见 sources/readings_extra.txt：
+    # 把含俗读字的词按"替换该字读音"再生成一条可打路径，扣这么多分，
+    # 保证标准读音优先，但俗读输入（如 shen'mo）也能命中而不再是死路。
+    "variant_penalty": 2.0,
     # 单字一律保留（组句必需），不参与裁剪
     "keep_all_chars": True,
 }
@@ -109,6 +126,25 @@ def normalize_syllable(syl):
                    if unicodedata.category(c) != "Mn").lower()
 
 
+def write_version_file(db_path):
+    """
+    把 DB 内容哈希写进同名 `.version` 文件（与 db 同目录，扩展名换成 .version）。
+
+    设备端 AssetDatabase 只在「assets 里的版本 ≠ 本地已装版本」时才重新解包。
+    所以这个文件**必须**随词库一起变——历史上它是手写整数，改了词库忘记 +1 就会
+    让覆盖安装的用户静默地继续用旧词库。内容哈希不存在"忘记"这个失败模式。
+    """
+    h = hashlib.md5()
+    with open(db_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    vpath = os.path.splitext(db_path)[0] + ".version"
+    with open(vpath, "w", encoding="utf-8") as f:
+        f.write(h.hexdigest()[:12])
+    print(f"   版本号 -> {vpath}  {h.hexdigest()[:12]}")
+    return vpath
+
+
 def read_lines(path):
     if not os.path.exists(path):
         return []
@@ -119,11 +155,36 @@ def read_lines(path):
 # ─────────────────────────────────────────────────────────────────────────────
 # 加载注音源
 # ─────────────────────────────────────────────────────────────────────────────
+def load_reading_extras():
+    """
+    补充读音（sources/readings_extra.txt）：官方字表未收、但日常输入必须支持的常读/俗读。
+    格式：字 <TAB> 读音[,读音...]。返回 {字: [读音...]}。
+    只追加，不改变主读音——主读音始终由语料投票决定。
+    """
+    extra = {}
+    for line in read_lines(os.path.join(SOURCES, "readings_extra.txt")):
+        if line.startswith("#"):
+            continue
+        parts = line.split("\t") if "\t" in line else line.split()
+        if len(parts) < 2:
+            continue
+        ch = parts[0].strip()
+        if len(ch) != 1:
+            continue
+        bucket = extra.setdefault(ch, [])
+        for r in parts[1].replace(",", " ").split():
+            rs = normalize_syllable(r)
+            if rs and rs not in bucket:
+                bucket.append(rs)
+    return extra
+
+
 def load_char_readings():
     """
     单字 -> [读音1, 读音2, ...]，读音1 为最常用。
     kTGHZ2013（《通用规范汉字表》8105 字）给全部读音；
-    kMandarin_8105 给最常用读音，用于把最常见读音排到第一位。
+    kMandarin_8105 给最常用读音，用于把最常见读音排到第一位；
+    最后并入 readings_extra.txt 的补充读音（追加，不影响上述主读音顺序）。
     """
     primary, all_readings = {}, {}
     p = os.path.join(DATA, "pinyin-data", "kMandarin_8105.txt")
@@ -159,6 +220,13 @@ def load_char_readings():
         if not reads:
             continue
         out[ch] = reads
+
+    # 补充读音：追加到末尾。放在最后是为了不让它顶掉官方主读音的顺序。
+    for ch, rs in load_reading_extras().items():
+        cur = out.setdefault(ch, [])
+        for r in rs:
+            if r not in cur:
+                cur.append(r)
     return out
 
 
@@ -321,6 +389,21 @@ def src_modern():
     return out
 
 
+def src_structured():
+    """
+    结构化组合词表（sources/structured.txt）：星期X / X月 / X点 / 第X个 / X年 / X个 …
+    这类"可推导的高频组合词"被所有通用词表系统性漏收，但它们恰恰是输入法最常打的词。
+    见文件头注释：星期一 -23.0、星期六完全缺失、一年/两点/第一个 直接不存在。
+    """
+    out = []
+    for line in read_lines(os.path.join(SOURCES, "structured.txt")):
+        if line.startswith("#"):
+            continue
+        for tok in line.split():
+            out.append(tok)
+    return out
+
+
 def src_thuocl():
     """THUOCL 领域词表："词\tDF"，按 DF 降序。返回 {领域名: [词...]}"""
     out = {}
@@ -376,7 +459,7 @@ def build_logp(sources, char_prob):
     thuocl = sources.get("thuocl", {})
 
     # 普通源
-    for name in ("word_freq", "oral", "modern", "common_boost"):
+    for name in ("word_freq", "oral", "modern", "common_boost", "structured"):
         words = sources.get(name) or []
         if not words:
             continue
@@ -430,10 +513,11 @@ def build(out_db, report_path, report_only=False):
         "oral": src_oral(),
         "modern": src_modern(),
         "common_boost": src_common_boost(),
+        "structured": src_structured(),
         "thuocl": src_thuocl(),
     }
     cn_words = src_cn_words()
-    for name in ("word_freq", "oral", "modern", "common_boost"):
+    for name in ("word_freq", "oral", "modern", "common_boost", "structured"):
         print(f"   {name:<14} {len(sources[name]):>7} 条")
     for d, ws in sources["thuocl"].items():
         print(f"   thuocl/{d:<8} {len(ws):>7} 条")
@@ -502,6 +586,33 @@ def build(out_db, report_path, report_only=False):
             flags |= FLAG_FOREIGN
         rows.append((py, w, to_digits(py), lp, flags))
         stat["保留整词注音" if whole else "保留逐字注音"] += 1
+
+    # ── 异读变体（sources/readings_extra.txt）
+    # 官方字表不收的常读会让整串数字**不可达**——不是"排得靠后"，是根本出不来。
+    # 例：么 官方只有 me，于是 98674466（做·什么）在库里一条候选都没有。
+    # 做法：对每个词，把含补充读音的字**逐个**替换成该读音，生成一条降权变体。
+    # 限制每个词最多替换 1 个字，避免多俗读字组合爆炸（当前表里只有「么」一条，
+    # 但机制要能容纳后续加词）。变体扣 variant_penalty，标准读音仍优先。
+    extras = load_reading_extras()
+    n_var = 0
+    if extras:
+        base_rows = rows
+        for py, w, _dg, lp, fl in base_rows:
+            syls = py.split("'")
+            if len(syls) != len(w):
+                continue
+            for i, ch in enumerate(w):
+                for alt in extras.get(ch, ()):
+                    if alt == syls[i]:
+                        continue
+                    ns = list(syls)
+                    ns[i] = alt
+                    npy = "'".join(ns)
+                    rows.append((npy, w, to_digits(npy), lp - CONFIG["variant_penalty"], fl))
+                    n_var += 1
+        stat["异读变体"] = n_var
+        print(f"   补充读音 {sum(len(v) for v in extras.values())} 条 / "
+              f"{len(extras)} 字 -> 生成异读变体 {n_var} 条")
 
     # 单字：保留全部读音。
     # 主读音由语料统计决定，而不是查表——kMandarin_8105 把「长」的主读音标成 zhǎng、
@@ -616,6 +727,11 @@ def build(out_db, report_path, report_only=False):
     db.close()
     size = os.path.getsize(out_db) / 1024 / 1024
     print(f"   {out_db}  {n} 条  {size:.1f} MB")
+
+    # 随包的版本号文件：设备端只在「assets 里的版本 ≠ 本地已装版本」时才重新解包。
+    # 手动维护整数版本号是个陷阱——改了词库却忘了 +1，覆盖安装时用户拿到的是**旧词库**，
+    # 而且完全静默。改成内容哈希：词库真变了版本才变，忘了也不会漏。
+    write_version_file(out_db)
 
     if report_path:
         try:

@@ -39,7 +39,9 @@ Dirichlet（加δ）平滑，δ 取语料无关的小常数：
       lm_meta(key, value)
 """
 import gzip
+import hashlib
 import os
+import shutil
 import sqlite3
 import sys
 import tarfile
@@ -337,7 +339,32 @@ def main():
     write_db(OUT, char_rows, bigram_rows, idx_of, meta, charset_size)
     size = os.path.getsize(OUT)
     print("写出 %s（%.2f MB）" % (OUT, size / 1048576))
+    publish(size)
     return 0
+
+
+def publish(size):
+    """
+    同步到 assets/ 并把**内容哈希**写进 `bigram.version`。
+
+    设备端 AssetDatabase 只在「assets 里的版本 ≠ 本地已装版本」时才重新解包，
+    所以版本号必须随模型一起变。手写整数版本号是陷阱：改了模型忘记 +1，
+    覆盖安装的用户会静默地继续用旧模型。内容哈希没有"忘记"这个失败模式。
+    """
+    import shutil
+    dst_dir = os.path.join(ASSET_DIR, "dict")
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, "bigram.db")
+    shutil.copyfile(OUT, dst)
+    h = hashlib.md5()
+    with open(dst, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    vpath = os.path.join(dst_dir, "bigram.version")
+    with open(vpath, "w", encoding="utf-8") as f:
+        f.write(h.hexdigest()[:12])
+    print("已发布 -> %s（%.2f MB）｜版本 %s"
+          % (dst, os.path.getsize(dst) / 1048576, h.hexdigest()[:12]))
 
 
 if __name__ == "__main__":

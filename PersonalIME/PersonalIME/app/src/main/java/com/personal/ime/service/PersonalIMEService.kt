@@ -96,6 +96,9 @@ class PersonalIMEService : InputMethodService() {
     companion object {
         /** T9 未提交数字串最大长度（支持整句连续打字，放宽到 20） */
         private const val MAX_T9_PENDING = 20
+
+        /** 向系统查"光标前一个字符"时一次取回的最大字符数（够剥掉组字区即可） */
+        private const val CONTEXT_PROBE_LEN = 32
     }
 
     // 符号键盘三页内容
@@ -1012,18 +1015,50 @@ class PersonalIMEService : InputMethodService() {
     }
 
     /** 候选查询：未选读法走三层优先级；选了读法后拼音过滤下推到 DB，避免该读法的字被窗口截断 */
-    private fun filteredCandidates(): List<PinyinEngine.Candidate> {
-        val selected = selectedPinyin ?: return pinyinEngine.inputT9(currentInput)
-        return pinyinEngine.inputT9ByPinyin(currentInput, selected)
+    private fun filteredCandidates(context: Char?): List<PinyinEngine.Candidate> {
+        val selected = selectedPinyin
+            ?: return pinyinEngine.inputT9(currentInput, context)
+        return pinyinEngine.inputT9ByPinyin(currentInput, selected, context = context)
     }
 
-    /** 展示/上屏用候选：打完的词（tier0）置顶 → 整句组合 → 其余候选（去重） */
+    /**
+     * 上文末字（阶段 4a）：光标前一个汉字，用来重排当前候选。
+     *
+     * 为什么不自己维护一个 `lastCommittedChar` 字段：光标可以被用户移到任意位置、
+     * 文本可以被删除、输入框可以切换。只有向系统问"光标前面是什么"才是准的，
+     * 自维护的状态一定会和编辑器实际内容漂移。
+     *
+     * 组字区里的数字串必须剥掉：打字时 composing text 就是 currentInput（如 "8426"），
+     * `getTextBeforeCursor` 会把它们一起返回，那显然不是"上文"。
+     * 隐私模式下直接返回 null（部分输入框不允许读取前后文）。
+     */
+    private fun contextCharBeforeCursor(): Char? {
+        if (isPrivacyMode) return null
+        val ic = currentInputConnection ?: return null
+        val raw = try {
+            ic.getTextBeforeCursor(CONTEXT_PROBE_LEN, 0)?.toString()
+        } catch (e: Exception) {
+            null
+        } ?: return null
+        var i = raw.length - 1
+        while (i >= 0 && (raw[i] in '0'..'9' || raw[i] == '\'' || raw[i] == ' ')) i--
+        return if (i >= 0) raw[i] else null
+    }
+
+    /**
+     * 展示/上屏用候选：打完的词（tier0）置顶 → 整句组合 → 其余候选（去重）。
+     *
+     * 阶段 4a：两条路径都带上"上文末字"。同一个数字串里选哪个字，很多情况下
+     * 词频根本无从判断（8426 = 天/条/调/挑，语料频率本就相近），
+     * 但前文是「今」时答案唯一。实测这一步把 Top-1 从 35% 提到 91%。
+     */
     private fun displayCandidates(): List<PinyinEngine.Candidate> {
-        val singles = filteredCandidates()
+        val context = contextCharBeforeCursor()
+        val singles = filteredCandidates(context)
         // 恰好打完的词（tier0）必须置顶，其次整句组合，再其余：
         // 整句若排最前，低频组合（如 黑我）会抢占空格位导致上屏错词（模拟测试发现）
         val exact = singles.filter { it.matchTier == 0 }
-        val sentences = pinyinEngine.sentenceCandidates(currentInput, 3)
+        val sentences = pinyinEngine.sentenceCandidates(currentInput, 3, context)
         val rest = singles.filter { it.matchTier != 0 }
         // 候选栏可横向滚动；全量覆盖率模拟表明 60 条可覆盖 95.5% 词条（含被高频词排后的字）
         return (exact + sentences + rest).distinctBy { it.text }.take(60)

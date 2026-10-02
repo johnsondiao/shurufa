@@ -50,6 +50,10 @@ class LanguageModel(private val appContext: Context) {
     @Volatile
     private var meanLogp = 0
 
+    /** 后字不在字符集时的退避下限（已中心化），见 [boundaryScore] */
+    @Volatile
+    private var floorScore = -100_000
+
     val isLoaded: Boolean get() = bigramMap != null
 
     /** 必须在后台线程调用（几 MB 拷贝） */
@@ -69,13 +73,20 @@ class LanguageModel(private val appContext: Context) {
         }
 
         val chars = HashMap<Int, Long>(MAX_CHARS)
+        var minLogp = Int.MAX_VALUE
+        var minNorm = Int.MAX_VALUE
         db.rawQuery("SELECT cp, logp, norm FROM $ALIAS.$TABLE_CHAR", null).use { c ->
             while (c.moveToNext()) {
+                val lp = c.getInt(1)
+                val nm = c.getInt(2)
+                if (lp < minLogp) minLogp = lp
+                if (nm < minNorm) minNorm = nm
                 // 高 32 位 = ln P_uni(c)，低 32 位 = ln(δ/(count(c)+δ))
-                chars[c.getInt(0)] = (c.getInt(1).toLong() shl 32) or
-                    (c.getInt(2).toLong() and 0xFFFF_FFFFL)
+                chars[c.getInt(0)] = (lp.toLong() shl 32) or (nm.toLong() and 0xFFFF_FFFFL)
             }
         }
+        // 退避下限：最罕见的后字 × 最常见的前字（= 中心化前可能取到的最小值）
+        floorScore = if (chars.isEmpty()) -100_000 else minLogp + minNorm - meanLogp
 
         val rows = db.rawQuery("SELECT COUNT(*) FROM $ALIAS.$TABLE_BIGRAM", null).use {
             if (it.moveToFirst()) it.getInt(0) else 0
@@ -95,7 +106,8 @@ class LanguageModel(private val appContext: Context) {
     /**
      * 词间边界分（毫纳特，已中心化），越大越优。
      *
-     * @return null 表示后字不在模型字符集内（拉丁/生僻字），调用方应跳过该项而非记 0 分
+     * @return null 表示**前字**不在模型字符集内（拉丁字母/标点当上下文），
+     *         此时是真正的"无上下文信息"，调用方应跳过该项而非记 0 分。
      */
     fun boundaryScore(prev: Char, next: Char): Int? {
         val map = bigramMap ?: return null
@@ -103,9 +115,15 @@ class LanguageModel(private val appContext: Context) {
         if (hit != LongIntMap.NOT_FOUND) return hit
 
         val chars = charMap ?: return null
-        val nextPacked = chars[next.code] ?: return null
-        val prevPacked = chars[prev.code]
-        return ((nextPacked shr 32).toInt() + (prevPacked?.toInt() ?: 0)) - meanLogp
+        val nextPacked = chars[next.code]
+        // 后字不在 char_uni：这不是"无信息"，而是"这个字在 4500 万字语料里几乎不出现"，
+        // 是很强的稀有证据，必须给退避下限。若当成 0 分，会出现「未知」压过
+        // 「已知但搭接差」的荒谬结果——实测上文为「后」时打 8426，「蜩/龆/盷」
+        // （语料里几乎为零）靠 0 加成反超中心化后为 -11.7 的「天」，把「天」挤出候选。
+        if (nextPacked == null) return floorScore
+
+        val prevPacked = chars[prev.code] ?: return null
+        return ((nextPacked shr 32).toInt() + prevPacked.toInt()) - meanLogp
     }
 
     companion object {

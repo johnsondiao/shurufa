@@ -503,3 +503,25 @@ city不city	net	niche	phrase
 慢	char	core	word
 真	char	core	word
 假	char	core	word
+
+# ── 结构化组合词域（星期X / X月 / 第X个 / X年 这类，通用词表系统性漏收）
+星期二	struct	common	word
+星期五	struct	common	word
+星期日	struct	common	word
+十二月	struct	common	word
+一个月	struct	common	word
+三个月	struct	common	word
+第一个	struct	core	word
+第二个	struct	common	word
+第一次	struct	core	word
+两点	struct	common	word
+六点	struct	common	word
+十点	struct	common	word
+十二点	struct	common	word
+一年	struct	core	word
+两年	struct	common	word
+三年	struct	common	word
+中国人	struct	core	word
+外国人	struct	common	word
+年轻人	struct	common	word
+点钟	struct	common	word
