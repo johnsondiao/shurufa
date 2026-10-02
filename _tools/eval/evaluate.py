@@ -33,7 +33,14 @@ import sqlite3
 import sys
 import unicodedata
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+# Windows 控制台默认 GBK，直接 print 中文会 UnicodeEncodeError，故包装为 utf-8。
+# 这里必须**幂等**：eval_bench.py 要 import 本模块，而本模块被 import 时也会执行到这行；
+# 每多包一层，上一层的 wrapper 被 GC 回收时会顺手 close 掉共用的底层 buffer，
+# 结果谁都写不出东西（"I/O operation on closed file"）。
+# 所以只在「当前还不是 utf-8 的 TextIOWrapper」时才包。
+_cur = sys.stdout
+if not (isinstance(_cur, io.TextIOWrapper) and _cur.encoding.lower() == "utf-8"):
+    sys.stdout = io.TextIOWrapper(_cur.buffer, encoding="utf-8", errors="replace")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # 默认评**真正打包进 APK 的那一份**词库，而不是任何中间产物。
@@ -264,7 +271,9 @@ def simulate_input_t9(db, digits, candidate_limit=60, lm=None, ctx=None, ctx_bet
         return [r for r in cur.fetchall() if has_cjk(r[0])]
 
     def ctx_bonus(word):
-        if ctx is None or lm is None or not word:
+        # `not ctx`（空串）必须和 None 一起挡掉：孤立输入的样本根本没有上文，
+        # 拿空串去查字符 bigram 会在 ord('') 上直接抛 TypeError。
+        if ctx is None or not ctx or lm is None or not word:
             return 0
         bs = lm.score(ctx, word[0])
         if bs is None:
@@ -337,8 +346,10 @@ def simulate_sentence_candidates(db, digits, limit=3, lm=None, beta=1000, sent_k
                     # logp 已是整数毫纳特，直接累加即可；旧整数档位原样累加
                     add = int(f)
                     if j == 0:
-                        # 首词：左邻是"上文"（上一个上屏词的末字），不是本串内的词
-                        if ctx is not None and lm is not None:
+                        # 首词：左邻是"上文"（上一个上屏词的末字），不是本串内的词。
+                        # 孤立输入样本没有上文，ctx 是空串而非 None——同样要挡掉，
+                        # 否则 ord('') 抛 TypeError，整轮评测中断。
+                        if ctx and lm is not None:
                             bs = lm.score(ctx, w[0])
                             if bs is not None:
                                 add += int(ctx_beta * bs) // 1000

@@ -1,0 +1,60 @@
+{
+  "db": "D:\\vibecoding\\shurufa\\PersonalIME\\PersonalIME\\app\\src\\main\\assets\\dict\\base_words.db",
+  "per_cell": 260,
+  "total": 9360,
+  "by_src": {
+    "news": {
+      "lines": 300000,
+      "chars": 16875450,
+      "samples": 39447
+    },
+    "spoken": {
+      "lines": 7572722,
+      "chars": 79779864,
+      "samples": 39742
+    },
+    "wiki": {
+      "lines": 432527,
+      "chars": 44854754,
+      "samples": 44413
+    }
+  },
+  "by_cell": {
+    "news|w1-2|ctx1-3": 260,
+    "news|w1-2|ctx10+": 260,
+    "news|w1-2|ctx4-9": 260,
+    "news|w3-4|ctx1-3": 260,
+    "news|w3-4|ctx10+": 260,
+    "news|w3-4|ctx4-9": 260,
+    "news|w5-9|ctx4-9": 260,
+    "news|w5-9|ctx10+": 260,
+    "news|w5-9|ctx1-3": 260,
+    "news|w1-2|ctx0": 260,
+    "news|w3-4|ctx0": 260,
+    "news|w5-9|ctx0": 260,
+    "spoken|w1-2|ctx0": 260,
+    "spoken|w1-2|ctx1-3": 260,
+    "spoken|w1-2|ctx4-9": 260,
+    "spoken|w1-2|ctx10+": 260,
+    "spoken|w3-4|ctx0": 260,
+    "spoken|w3-4|ctx1-3": 260,
+    "spoken|w3-4|ctx4-9": 260,
+    "spoken|w3-4|ctx10+": 260,
+    "spoken|w5-9|ctx4-9": 260,
+    "spoken|w5-9|ctx1-3": 260,
+    "spoken|w5-9|ctx0": 260,
+    "spoken|w5-9|ctx10+": 260,
+    "wiki|w1-2|ctx1-3": 260,
+    "wiki|w1-2|ctx4-9": 260,
+    "wiki|w3-4|ctx4-9": 260,
+    "wiki|w3-4|ctx10+": 260,
+    "wiki|w1-2|ctx10+": 260,
+    "wiki|w3-4|ctx1-3": 260,
+    "wiki|w1-2|ctx0": 260,
+    "wiki|w5-9|ctx4-9": 260,
+    "wiki|w5-9|ctx1-3": 260,
+    "wiki|w5-9|ctx10+": 260,
+    "wiki|w3-4|ctx0": 260,
+    "wiki|w5-9|ctx0": 260
+  }
+}
