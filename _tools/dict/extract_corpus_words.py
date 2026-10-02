@@ -72,8 +72,18 @@ INDEX_MARK = ("inv_", "words", ".sql", "_n.", "_s.", "co_")
 CJK = re.compile(r"[\u4e00-\u9fff]+")
 
 MIN_FREQ = 40        # 频次门槛：实测「好多了」在全语料 ~3.1k，「多了去了」~65，都远超
+MIN_FREQ3 = 100      # 3 字门槛：手写词表回归暴露出「开会了 118 / 发工资 115」这类词
+                     # 证据在 100~300 之间，300 的门槛会漏；100 以下开始混入噪声
 NGRAMS = (2, 3)      # 只抽 2/3 字：4 字以上已有 cn_words(40 万词组) 覆盖
-MAX_KEEP = 40000     # 最多保留多少个词（超出部分 Zipf 份额已趋零，留着只占体积）
+MAX_KEEP2 = 50000    # 2/3 字**分池**配额。共用一个 4 万总池的教训：
+                     # 2 字词频次≥40 的有 21 万条，把低频 2 字词全放进总池排序，
+                     # 会把「差不多了(923 次)」「快好了(426 次)」这类真短语挤出 4 万名开外——
+                     # 手写 248 词回归里它们恰好全缺。分池后 3 字短语不受 2 字长尾挤压。
+                     # 3 字池 3 万仍不够：频次 115~300 的 3 字词（发工资 115 / 开会了 118 /
+                     # 洗澡了 206）排在 3 万名之外（≥300 的就有 3.03 万条）→ 3 字池放大到全收，
+                     # 2 字池提到 5 万（覆盖到频次 ~130，救回「跑着 134 / 饺子 207」）。
+                     # 体积代价 ~3 MB，验收看 build 产物大小与首屏命中率不跌破。
+MAX_KEEP3 = 80000
 
 
 def open_text_stream(path):
@@ -180,8 +190,16 @@ def build_inside(n_gram_len, freq_long):
     return inside
 
 
-def is_word(gram, f, inside, ratio=0.6):
-    """内部片段占比过高 => 它只是某个长串的一部分，不是独立词。"""
+def is_word(gram, f, inside, ratio=0.9):
+    """
+    寄生判据：inside[w] = 包住 w 的**最长串里的最高频次**（max 传播，见 build_inside）。
+
+    ratio 0.9 的依据：寄生片段的特征是"几乎从不独立出现"——
+      「新冠肺」4140 次，但「新冠肺炎」一个串就 8000+，比值远超 1 → 杀；
+      「发工资」115 次，「发工资了」约 100 次，比值 ≈0.87 < 0.9 → **必须留**。
+    早期用 0.6 时「发工资/开会了/洗澡了」这类「X了」短语全被误杀：
+    它们天然总裹在「X了Y」的 4 字串里，0.6 线把"正常的黏着"错判成"寄生"。
+    """
     return inside.get(gram, 0) < f * ratio
 
 
@@ -191,8 +209,9 @@ def main() -> int:
     # 3 字词门槛单独设（默认比 2 字词高）：3 元组合空间大得多，频次 40 的 3 字串
     # 里非词比例很高。实测「好多了」3.1k、「新冠肺」4.1k，两者量级相当，
     # 所以 3 字的门槛不能只靠频次，主要靠词组词典挡内部片段。
-    ap.add_argument("--min-freq3", type=int, default=300)
-    ap.add_argument("--max-keep", type=int, default=MAX_KEEP)
+    ap.add_argument("--min-freq3", type=int, default=MIN_FREQ3)
+    ap.add_argument("--max-keep2", type=int, default=MAX_KEEP2)
+    ap.add_argument("--max-keep3", type=int, default=MAX_KEEP3)
     ap.add_argument("--out", default=OUT_TXT)
     args = ap.parse_args()
 
@@ -236,25 +255,31 @@ def main() -> int:
     inside2 = build_inside(2, f3)     # 「我的」被「我的世界」包住的频次
     inside3 = build_inside(3, f4)     # 「新冠肺」被「新冠肺炎」包住的频次
 
-    kept = []
+    kept3 = []
     for w, n in f3.items():
         if not is_word(w, n, inside3) or w in phrase_bad:
             continue
-        kept.append((w, n))
-    n3_kept = len(kept)
+        kept3.append((w, n))
+    n3_kept = len(kept3)
 
-    n2_kept = 0
+    kept2 = []
     for w, n in freq[2].items():
         if n < args.min_freq:
             continue
         if not is_word(w, n, inside2):
             continue
-        kept.append((w, n))
-        n2_kept += 1
+        kept2.append((w, n))
+    n2_kept = len(kept2)
 
     print(f"  通过判据：3 字 {n3_kept:,} 条 ｜ 2 字 {n2_kept:,} 条")
-    kept.sort(key=lambda kv: (-kv[1], kv[0]))
-    kept = kept[: args.max_keep]
+    # 分池截断：2/3 字各自按频次取 top，互不挤压（教训见 MAX_KEEP2 注释）
+    kept3.sort(key=lambda kv: (-kv[1], kv[0]))
+    kept2.sort(key=lambda kv: (-kv[1], kv[0]))
+    kept3 = kept3[: args.max_keep3]
+    kept2 = kept2[: args.max_keep2]
+    kept = kept2 + kept3
+    print(f"  收入：2 字 {len(kept2):,} (配额 {args.max_keep2:,}) ｜ "
+          f"3 字 {len(kept3):,} (配额 {args.max_keep3:,})")
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
