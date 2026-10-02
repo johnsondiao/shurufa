@@ -235,14 +235,16 @@ class PersonalIMEService : InputMethodService() {
             keyboardPage == KeyboardPage.NUMBER -> buildNumberKeyboard(container)
             else -> buildT9Keyboard(container)
         }
-        // 左侧列仅 T9 主键盘显示，宽度恒定以避免键盘左右跳动；
+        // 左侧列仅 T9 主键盘与数字页显示（两页共用同一套 4 行骨架，列宽恒定，避免切页跳动）；
         // 默认填标点，输入后 updateCandidates 会按需换成拼音选择列。
-        // 符号/数字/英文页隐藏左侧列（符号页自带左侧标点列）。
-        val isT9Main = inputMode == InputMode.CHINESE_T9 && keyboardPage == KeyboardPage.T9
-        if (isT9Main) {
+        // 符号/英文页隐藏左侧列（符号页自带左侧标点列）。
+        val keepLeftColumn = inputMode == InputMode.CHINESE_T9 &&
+            (keyboardPage == KeyboardPage.T9 || keyboardPage == KeyboardPage.NUMBER)
+        if (keepLeftColumn) {
             pinyinSelectorScroll?.visibility = View.VISIBLE
             pinyinSelector?.removeAllViews()
-            populatePunctuationColumn()
+            // 数字页左列：前三格标点 + 第 4 格「符号」，与微信数字键盘一致
+            if (keyboardPage == KeyboardPage.NUMBER) populateNumberColumn() else populatePunctuationColumn()
         } else {
             pinyinSelectorScroll?.visibility = View.GONE
             pinyinSelector?.removeAllViews()
@@ -332,39 +334,42 @@ class PersonalIMEService : InputMethodService() {
     }
 
     /**
-     * 数字键盘布局（4 列）：
-     * 1  2  3  ⌫
-     * 4  5  6  重输
-     * 7  8  9  换行(跨2行)
-     * 0  #  *  返回
-     * 底行：符号  空格  中/英
+     * 数字键盘：完全复用九键的骨架（左标点列 + 中 3 列 + 右列，共 4 行等高）。
+     * 1-9 正落在九键 ABC/DEF/GHI/JKL/MNO/PQRS/TUV/WXYZ 原来的格子里，
+     * 所以从拼音九键切到 123 时不用重新找手指位置（微信数字键盘就是这个做法）；
+     * 代价是按键比「三列数字 + 整列功能键」那版窄，好处是切页零位移。
+     *
+     * 行1      1  2  3   | ⌫
+     * 行2      4  5  6   | 空格
+     * 行3      7  8  9   | 换行
+     * 行4 返回  0  .      | 中/英        （左列前三格是标点，第 4 格是「符号」）
      */
     private fun buildNumberKeyboard(container: LinearLayout) {
-        val rows = arrayOf(
+        val digitRows = arrayOf(
             arrayOf("1", "2", "3"),
             arrayOf("4", "5", "6"),
-            arrayOf("7", "8", "9"),
-            arrayOf("0", "#", "*")
+            arrayOf("7", "8", "9")
         )
-        for (row in rows.indices) {
+        for (r in digitRows.indices) {
             val rowView = createKeyboardRow()
-            for (col in rows[row].indices) {
-                val label = rows[row][col]
+            for (col in digitRows[r].indices) {
+                val label = digitRows[r][col]
                 rowView.addView(createNumberKey(label, { commitPlainText(label) }))
             }
-            when (row) {
+            when (r) {
                 0 -> rowView.addView(createSpecialKey("⌫", ::handleDelete))
-                1 -> rowView.addView(createSpecialKey("重输", ::clearInput))
+                1 -> rowView.addView(createSpecialKey("空格", { handleSpace() }))
                 2 -> rowView.addView(createSpecialKey("换行", ::handleEnter))
-                3 -> rowView.addView(createSpecialKey("返回", ::backToT9))
             }
             container.addView(rowView)
         }
 
+        // 底行：与九键底行同一行高、同样是 4 格（符号 | 123 | 空格 | 中/英 的位置）
         val bottomRow = createKeyboardRow()
-        bottomRow.addView(createSpecialKey("符号", ::showSymbols))
-        bottomRow.addView(createSpecialKey("空格", { handleSpace() }, weight = 2f))
-        bottomRow.addView(createSpecialKey(modeLabel(), ::toggleInputMode))
+        bottomRow.addView(createSpecialKey("返回", ::backToT9))
+        bottomRow.addView(createNumberKey("0", { commitPlainText("0") }))
+        bottomRow.addView(createNumberKey(".", { commitPlainText(".") }))
+        bottomRow.addView(createModeKey())
         container.addView(bottomRow)
     }
 
@@ -474,11 +479,11 @@ class PersonalIMEService : InputMethodService() {
         }
     }
 
-    private fun createNumberKey(label: String, onClick: () -> Unit): Button {
+    private fun createNumberKey(label: String, onClick: () -> Unit, weight: Float = 1f): Button {
         return Button(this).apply {
             text = label
             textSize = keySizeSp + 2f
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, weight).apply {
                 setMargins(keyMarginPx, keyMarginPx, keyMarginPx, keyMarginPx)
             }
             setOnClickListener { onClick() }
@@ -991,6 +996,14 @@ class PersonalIMEService : InputMethodService() {
     }
 
     /** 左侧列无拼音选择时的默认内容：半角标点 + 分词键（仿微信输入法左列，宽度恒定避免键盘左右跳动） */
+    /** 数字页左侧列：前三格标点（高度对齐键盘行），第 4 格放「符号」入口 */
+    private fun populateNumberColumn() {
+        arrayOf(",", "/", ".").forEach { p ->
+            pinyinSelector?.addView(createPunctuationKey(p))
+        }
+        pinyinSelector?.addView(createPunctuationKey("符号") { showSymbols() })
+    }
+
     private fun populatePunctuationColumn() {
         arrayOf(",", ".", "/", "?").forEach { p ->
             pinyinSelector?.addView(createPunctuationKey(p))
