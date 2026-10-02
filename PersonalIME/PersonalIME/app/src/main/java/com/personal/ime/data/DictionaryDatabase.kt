@@ -12,6 +12,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlin.math.ln
 import kotlin.math.pow
+import kotlin.math.roundToInt
 
 /**
  * 词库数据层（v1，用户库 `ime_user.db` + 挂载只读基础库 `base_words.db` + 语言模型 `bigram.db`）
@@ -35,7 +36,8 @@ import kotlin.math.pow
  * ## 分数单位
  * 所有分数统一为 **毫纳特（natural log × 1000）的整数**，越大越优。
  * 基础词 logp 范围约 -26000 ~ -3000（离线流水线产出）。
- * 用户偏好通过 [PREF_DOMINANCE] 直接压过基础档，而不是去调一个"不撞档的魔数"。
+ * 用户偏好按「习惯强度」**连续**折算成增益（见 [preferenceBonus]），上限 [PREF_DOMINANCE]：
+ * 选得越多越强，但边际递减、久了自然退场。既不是"不撞档的魔数"，也不是"过线就加满"。
  *
  * ## 为什么不用 WAL
  * ATTACH 是**连接级**状态，而启用 WAL 会让 Android 使用连接池，
@@ -225,24 +227,25 @@ class DictionaryDatabase(private val appContext: Context) :
         }
 
         // 2) 用户偏好：同样按词前缀取，命中者从 base 补回条目再加成
-        val prefSet = HashSet<String>()
+        //    加成口径与 mergeUserWords 完全一致（连续、不设门槛）——这里不做"捞回"
+        //    门槛判断：进来的词本来就在联想结果里，给它一份相符的加成即可。
+        val prefBonus = HashMap<String, Int>()
         database.rawQuery(
             "SELECT key, cnt, t_last FROM $TABLE_USER_PREF WHERE scope = ? AND key GLOB ?",
             arrayOf(SCOPE_WORD, glob)
         ).use { c ->
             // 与 appendPreferredWords 同一考虑：下面要用 key IN (?,…) 拼语句，必须封顶
-            while (c.moveToNext() && prefSet.size < PREF_FETCH_MAX) {
-                if (preferenceWeight(c.getLong(1), c.getLong(2), now) >= PREF_MIN_WEIGHT) {
-                    prefSet.add(c.getString(0))
-                }
+            while (c.moveToNext() && prefBonus.size < PREF_FETCH_MAX) {
+                val bonus = preferenceBonus(preferenceWeight(c.getLong(1), c.getLong(2), now))
+                if (bonus > 0) prefBonus[c.getString(0)] = bonus
             }
         }
-        if (prefSet.isNotEmpty()) {
-            val marks = prefSet.joinToString(",") { "?" }
+        if (prefBonus.isNotEmpty()) {
+            val marks = prefBonus.keys.joinToString(",") { "?" }
             database.rawQuery(
                 "SELECT $COL_WORD, $COL_PINYIN, $COL_LOGP, $COL_FLAGS " +
                     "FROM ${BaseDictionary.ALIAS}.${BaseDictionary.TABLE} WHERE $COL_WORD IN ($marks)",
-                prefSet.toTypedArray()
+                prefBonus.keys.toTypedArray()
             ).use { c ->
                 while (c.moveToNext()) {
                     val e = c.toEntry()
@@ -254,7 +257,8 @@ class DictionaryDatabase(private val appContext: Context) :
 
         out.clear()
         out.addAll(byWord.values.map { e ->
-            if (e.word in prefSet) e.copy(score = e.score + PREF_DOMINANCE) else e
+            val bonus = prefBonus[e.word] ?: 0
+            if (bonus == 0) e else e.copy(score = e.score + bonus)
         })
     }
 
@@ -331,6 +335,12 @@ class DictionaryDatabase(private val appContext: Context) :
      *
      * 窗口越小越明显：整句候选给每个子串的窗口只有 WORDS_PER_SUB=6 条。
      *
+     * ## 捞回门槛
+     * 只有权重 ≥ [PREF_MIN_WEIGHT] 的词才值得捞：捞回要额外查一次 base，
+     * 而更低的权重折算出的加成（≤520 毫纳特）已不足以改变排序，
+     * 补进来也只是多几个不动的候选。**这正是 [PREF_MIN_WEIGHT] 唯一的职责**——
+     * 加成本身是连续的、不设门槛。
+     *
      * ## 代价
      * 多一次 `user_pref` 查询；只有真的存在偏好词（且不在窗口内）时才再查一次 base。
      * 无偏好时是空结果，热路径上只多一条索引查询。上限 [PREF_FETCH_MAX] 防止
@@ -338,14 +348,16 @@ class DictionaryDatabase(private val appContext: Context) :
      */
     private fun appendPreferredWords(out: MutableList<WordEntry>, digitsPattern: String) {
         val likeArg = if (digitsPattern.endsWith("*")) digitsPattern else "$digitsPattern*"
+        val now = System.currentTimeMillis() / 1000L
         val have = HashSet<String>(out.size * 2 + 8)
         for (e in out) have.add(e.word)
         val missing = ArrayList<String>()
         db().rawQuery(
-            "SELECT key FROM $TABLE_USER_PREF WHERE scope = ? AND $COL_DIGITS GLOB ?",
+            "SELECT key, cnt, t_last FROM $TABLE_USER_PREF WHERE scope = ? AND $COL_DIGITS GLOB ?",
             arrayOf(SCOPE_WORD, likeArg)
         ).use { c ->
             while (c.moveToNext() && missing.size < PREF_FETCH_MAX) {
+                if (preferenceWeight(c.getLong(1), c.getLong(2), now) < PREF_MIN_WEIGHT) continue
                 val w = c.getString(0)
                 if (have.add(w)) missing.add(w)
             }
@@ -383,17 +395,15 @@ class DictionaryDatabase(private val appContext: Context) :
                 }
             }
         }
-        // 2) 用户偏好：按 Δt 指数衰减后转成压制性加成
+        // 2) 用户偏好：按 Δt 连续折算加成（不设门槛，平滑衰减到 0）
         val prefBonus = HashMap<String, Int>()
         database.rawQuery(
             "SELECT key, cnt, t_last FROM $TABLE_USER_PREF WHERE scope = ? AND $COL_DIGITS GLOB ?",
             arrayOf(SCOPE_WORD, likeArg)
         ).use { c ->
             while (c.moveToNext()) {
-                val weight = preferenceWeight(c.getLong(1), c.getLong(2), now)
-                if (weight >= PREF_MIN_WEIGHT) {
-                    prefBonus[c.getString(0)] = PREF_DOMINANCE
-                }
+                val bonus = preferenceBonus(preferenceWeight(c.getLong(1), c.getLong(2), now))
+                if (bonus > 0) prefBonus[c.getString(0)] = bonus
             }
         }
 
@@ -413,14 +423,40 @@ class DictionaryDatabase(private val appContext: Context) :
     }
 
     /**
-     * 偏好权重（纳特）：`ln(1+cnt) · 2^(-Δt/半衰期)`
-     * - `ln(1+cnt)` 让"反复选择"比"偶尔误选"更稳
-     * - 指数项让旧习惯自然退场：半衰期 7 天，约 3 周后低于阈值自动失宠
+     * 偏好权重（纳特），即"习惯强度"：`ln(1+cnt) · 2^(-Δt/半衰期)`
+     * - `ln(1+cnt)` 让"反复选择"比"偶尔误选"更稳（对数增长，边际递减）
+     * - 指数项让旧习惯自然退场：半衰期 7 天
      */
     private fun preferenceWeight(cnt: Long, tLast: Long, now: Long): Double {
         if (cnt <= 0) return 0.0
         val deltaDays = ((now - tLast).coerceAtLeast(0L)) / 86400.0
         return ln(1.0 + cnt) * 0.5.pow(deltaDays / PREF_HALF_LIFE_DAYS)
+    }
+
+    /**
+     * 偏好加成（毫纳特）：把"习惯强度"**连续**折算成分数增益。
+     *
+     *     bonus = min(PREF_DOMINANCE, PREF_BONUS_PER_NAT · weight)
+     *
+     * ## 为什么必须是连续的（旧实现是二值门槛）
+     * 旧实现是「权重 ≥ 0.15 → 一律 +40000」。而实测同组内"第 2 名追到第 1 名"的
+     * 中位分差只有 **1592 毫纳特**，40000 是它的 25 倍 —— 于是**一次误触**就把该
+     * 数字组里所有词压下去，并且持续到衰减跌破阈值为止（一次选择约 15.5 天）。
+     * 表现就是：在 64426 上误选过一次「蜜柑」，之后打「你好」它都顶在最前面。
+     *
+     * 现在一次选择的加成约 4159（`ln2 × 6000`）：只够改写"近义同音"这类贴近的竞争
+     * （第 2 名 70%、第 3 名 50% 会被翻盘），而第 10 名之后一次选择几乎不动（9.8%）。
+     * 要把靠后的词顶上来，得真的反复用过它。逐次/逐日的完整曲线见
+     * `_tools/eval/report_preference.md`（由 `eval_preference.py` 生成）。
+     *
+     * ## 为什么没有门槛
+     * 门槛会在门槛处留下断崖：权重 0.15 时加成 520，一过门槛直接变 0，
+     * 而同组最近对手分差的 25 分位才 522 —— 看得见。不设门槛时，
+     * 加成随权重平滑趋近 0，退场是渐变的，不存在"突然忘掉"。
+     */
+    private fun preferenceBonus(weight: Double): Int {
+        if (weight <= 0.0) return 0
+        return minOf(PREF_DOMINANCE, (PREF_BONUS_PER_NAT * weight).roundToInt())
     }
 
     // ──────────────────────────────────────────────────────────── 学习
@@ -500,11 +536,25 @@ class DictionaryDatabase(private val appContext: Context) :
         private const val USER_WORD_LOGP = -2000
 
         /**
-         * 偏好压制加成（毫纳特）。基础词 logp 范围约 -26000 ~ -3000，
-         * 取 40000 保证被偏好的词**一定**压过任何基础词，无需去猜同音组里的最大分。
-         * 这是"随使用越来越懂你"的实现方式，而衰减负责让它自然退场。
+         * 偏好加成的上限（毫纳特）。保留"重度使用可以压过任何基础词"的语义
+         * （基础词 logp 范围约 -26000 ~ -3000），按当前斜率要 ~790 次选择才触及。
          */
         private const val PREF_DOMINANCE = 40000
+
+        /**
+         * 每 1 纳特偏好权重折算成多少毫纳特加成。
+         *
+         * ## 这个数是怎么来的（不是凑的）
+         * 实测同组内"第 2 名追到第 1 名"的分差：中位 1592、75 分位 7079
+         * （见 `_tools/eval/report_preference.md`）。一次有意选择的权重是 `ln 2 ≈ 0.693`，
+         * 希望它的加成**稳过典型近邻、但不横扫整组** —— 取 4159：
+         * 是中位近邻的 2.6 倍（稳），比 75 分位低 41%（不横扫）。
+         * `4159 / 0.693 ≈ 6000`。
+         *
+         * 于是「把第 5 名顶上来」需要 10 次左右，「第 20 名」需要长期反复——
+         * *选择即学习，但学习要有分量*。
+         */
+        private const val PREF_BONUS_PER_NAT = 6000
 
         /**
          * 一次最多补回多少个"窗口外"的偏好词。
@@ -515,7 +565,17 @@ class DictionaryDatabase(private val appContext: Context) :
          */
         private const val PREF_FETCH_MAX = 32
 
-        /** 偏好权重阈值（纳特）：低于此值视为已遗忘 */
+        /**
+         * "捞回"门槛（纳特）：权重低于此值，就不再把这个词从**候选窗口之外**补进来。
+         *
+         * 注意它**只**管"要不要捞回"，不管加成大小 —— 加成是连续的、不设门槛。
+         * 设门槛就会在门槛处留下断崖（权重 0.15 时加成 520 毫纳特，一过门槛变 0，
+         * 而同组最近对手分差的 25 分位才 522，这道断崖是看得见的）。
+         * 这里保留它的理由是成本：捞回要额外查一次 base，而 ≤0.15 的权重贡献的加成
+         * 已经不足以改变排序，不值得为此多付一次查询。
+         *
+         * 0.15 对应一次误选约 21 天后（半衰期 7 天），即"三周不用就自然淡出"。
+         */
         private const val PREF_MIN_WEIGHT = 0.15
 
         /** 偏好半衰期（天）：约 3 周后一次误选自然失宠 */
