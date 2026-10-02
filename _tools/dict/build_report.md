@@ -1,7 +1,7 @@
 # 词库构建报告
 
-- 输出：`PersonalIME\PersonalIME\app\src\main\assets\dict\base_words.db`，**387593** 条，25.3 MB
-- 裁剪阈值 logp < -26.0（裁掉 154101 条生僻词；**判据用不带字符链的 unigram 分**，故词库规模与 oov_chain_mu 无关）
+- 输出：`PersonalIME\PersonalIME\app\src\main\assets\dict\base_words.db`，**413431** 条，26.7 MB
+- 裁剪阈值 logp < -26.0（裁掉 153888 条生僻词；**判据用不带字符链的 unigram 分**，故词库规模与 oov_chain_mu 无关）
 - λ(oov) = 0.02
 - 字符 bigram 链（阶段 4c）：oov_chain_mu = 1.0
 
@@ -28,7 +28,7 @@
 
 ## logp 分布
 
-最小 -65.22 ｜ 中位 -17.46 ｜ 最大 -3.03
+最小 -65.22 ｜ 中位 -16.91 ｜ 最大 -3.03
 
 ## 被裁剪样本（最生僻 30 条）
 

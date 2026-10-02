@@ -69,6 +69,15 @@ CONFIG = {
         "modern":       {"weight": 0.16, "k": 5},
         "common_boost": {"weight": 0.10, "k": 5},
         "thuocl":       {"weight": 0.06, "k": 50},   # 每个领域各一份，均分该权重
+        # corpus_words = 语料直抽词（_tools/dict/extract_corpus_words.py 生成）。
+        # weight 0.30 是按"它补的是什么"定的，不是随手填的：
+        #   它和 word_freq 同性质（都是常用词频次证据），但语料只 ~2.6 亿字
+        #   （news 16M + opensub 170M + wiki 45M），且 opensub 是影视字幕、带翻译腔，
+        #   证据密度不如 word_freq 号称的 2.5 亿字，所以给 0.44 的约七成；
+        #   又不低于 oral 的 0.24 —— 因为缺的正是"功能词"，靠人工 595 词的 oral 补不回来。
+        # 接进来后必须跑回归：语料直抽会带进噪声词（「新冠肺」这类），
+        # 若 Top-1 / 首屏命中率不升，就把这个权重往下调，别硬塞。
+        "corpus_words": {"weight": 0.30, "k": 10},
         # structured 是"净增"权重（Σweight 因此为 1.05，不再等于 1）：
         # 实测把现有 5 个源等比缩放来腾出权重，会让 Top-1 掉 0.6 个百分点——
         # 因为那几个源之间的相对关系是调过的，任何缩放都是无谓扰动。
@@ -486,6 +495,41 @@ def src_word_freq():
     return [w for w, _ in rows]
 
 
+def src_corpus_words():
+    """
+    语料直抽词源（sources/corpus_words.txt，"词 频次"，按频次降序）。
+
+    **为什么必须有它**：现有五个源（word_freq / oral / modern / common_boost /
+    structured）加十二个 THUOCL 领域表，**没有任何一个收录虚词类功能词**——
+    「我的 / 好了 / 多了 / 来了 / 看着 / 大了」全部查无此词，以「了」收尾的整库
+    只有 165 条且多是「一着 / 上着」这类生僻串。用户报的「好多了」打不出来就卡在这。
+    根因不是阈值，是词源缺口：`legacy/word_freq.txt` 连「我的 / 这个」都没有
+    （却收「题库 / 签筒」），`cn_words.txt` 是 `拼音 词 频次` 的**词组清单**，
+    只有「我的世界 / 多了去了」这种长串。
+
+    而这些词在语料里 abundant（实测 opensub+wiki：「我的」32.2 万次、
+    「好了」9.8 万次、「好多了」3.1 千次）。所以不手工补词，而是把语料里本来就有的
+    词证据抽出来（见 `_tools/dict/extract_corpus_words.py`），与 word_freq 完全同构
+    地按序位进 Zipf 混合。
+
+    产物由脚本生成、不手写：手写等于往资产里塞拍脑袋的词，下次还会再缺一批。
+    """
+    out = []
+    path = os.path.join(SOURCES, "corpus_words.txt")
+    if not os.path.exists(path):
+        print("   [警告] 缺 sources/corpus_words.txt，先跑 "
+              "`python _tools/dict/extract_corpus_words.py`")
+        return out
+    for line in read_lines(path):
+        if line.startswith("#"):
+            continue
+        parts = line.split()
+        if not parts:
+            continue
+        out.append(parts[0])      # 行序即频次序；频次本身不参与（Zipf 用序位）
+    return out
+
+
 def src_oral():
     """人工精编的口语高频词（sources/oral.txt，文件顺序即频次序）"""
     out = []
@@ -592,7 +636,8 @@ def build_logp(sources, char_prob, chain=None):
     thuocl = sources.get("thuocl", {})
 
     # 普通源
-    for name in ("word_freq", "oral", "modern", "common_boost", "structured"):
+    for name in ("word_freq", "oral", "modern", "common_boost", "structured",
+                 "corpus_words"):
         words = sources.get(name) or []
         if not words:
             continue
@@ -659,10 +704,12 @@ def build(out_db, report_path, report_only=False):
         "modern": src_modern(),
         "common_boost": src_common_boost(),
         "structured": src_structured(),
+        "corpus_words": src_corpus_words(),
         "thuocl": src_thuocl(),
     }
     cn_words = src_cn_words()
-    for name in ("word_freq", "oral", "modern", "common_boost", "structured"):
+    for name in ("word_freq", "oral", "modern", "common_boost", "structured",
+                 "corpus_words"):
         print(f"   {name:<14} {len(sources[name]):>7} 条")
     for d, ws in sources["thuocl"].items():
         print(f"   thuocl/{d:<8} {len(ws):>7} 条")
