@@ -504,6 +504,29 @@ class DictionaryDatabase(private val appContext: Context) :
         addUserWord(lower, word)
     }
 
+    /**
+     * 词是否为用户自造词（user_words 中存在）。
+     * 用于「首次记住才 Toast 提示」与「长按候选判断能否删除」，同步查询——
+     * user_words 只有几十条且带 word 索引，主线程开销可忽略。
+     */
+    fun hasUserWord(word: String): Boolean {
+        return db().query(
+            TABLE_USER_WORDS, arrayOf(COL_WORD),
+            "$COL_WORD = ?", arrayOf(word), null, null, null, "1"
+        ).use { it.count > 0 }
+    }
+
+    /**
+     * 删除自造词（长按候选触发）。误学的词必须有出口，否则「被迫选中 = 永久霸榜」
+     * 没有反悔机会——商业输入法全都提供删自造词入口。
+     * 只删 user_words：base_words 是只读资产，删不了也不该删。
+     */
+    fun removeUserWord(word: String) {
+        ioScope.launch {
+            db().delete(TABLE_USER_WORDS, "$COL_WORD = ?", arrayOf(word))
+        }
+    }
+
     /** 清空全部用户数据（不影响基础词库）——旧版只能靠"清除应用数据"才能做到 */
     fun resetUserData() {
         ioScope.launch {

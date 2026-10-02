@@ -472,6 +472,13 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         database.addUserWord(pinyin, word)
     }
 
+    fun hasUserWord(word: String): Boolean = database.hasUserWord(word)
+
+    /** 删除自造词（长按候选触发）；基础词库的词删不掉，返回是否真的删了 */
+    fun removeUserWord(word: String) {
+        database.removeUserWord(word)
+    }
+
     companion object {
         private const val CANDIDATE_LIMIT = 60
         private const val PREFIX_EXACT_LIMIT = 16

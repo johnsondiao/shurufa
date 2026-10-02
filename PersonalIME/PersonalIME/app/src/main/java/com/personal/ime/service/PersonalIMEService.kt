@@ -935,7 +935,7 @@ class PersonalIMEService : InputMethodService() {
                 englishEngine.predict(currentInput).take(20).forEachIndexed { index, word ->
                     val display = applyInputCase(word)
                     candidatesView.addView(
-                        createCandidateView(display, index == 0) { commitEnglishWithAutoBack(display) }
+                        createCandidateView(display, index == 0, { commitEnglishWithAutoBack(display) })
                     )
                 }
             }
@@ -957,7 +957,7 @@ class PersonalIMEService : InputMethodService() {
             populatePunctuationColumn()
             associationCandidates.forEachIndexed { index, c ->
                 candidatesView.addView(
-                    createCandidateView(c.text, index == 0) { commitCandidate(c) }
+                    createCandidateView(c.text, index == 0, { commitCandidate(c) })
                 )
             }
             return
@@ -990,9 +990,23 @@ class PersonalIMEService : InputMethodService() {
         val candidates = displayCandidates()
         candidates.forEachIndexed { index, candidate ->
             candidatesView.addView(
-                createCandidateView(candidate.text, index == 0) { commitCandidate(candidate) }
+                createCandidateView(candidate.text, index == 0, { commitCandidate(candidate) },
+                    onLongClick = { deleteCandidateIfUserWord(candidate) })
             )
         }
+    }
+
+    /**
+     * 长按候选删除自造词。仅 user_words 里的词可删（误学出口），
+     * 基础词库是只读资产——hasUserWord 为 false 时静默忽略，不弹提示。
+     */
+    private fun deleteCandidateIfUserWord(candidate: PinyinEngine.Candidate) {
+        if (!pinyinEngine.hasUserWord(candidate.text)) return
+        pinyinEngine.removeUserWord(candidate.text)
+        android.widget.Toast.makeText(
+            this, "已删除「${candidate.text}」", android.widget.Toast.LENGTH_SHORT
+        ).show()
+        updateCandidates()
     }
 
     /** 左侧列无拼音选择时的默认内容：半角标点 + 分词键（仿微信输入法左列，宽度恒定避免键盘左右跳动） */
@@ -1108,7 +1122,9 @@ class PersonalIMEService : InputMethodService() {
         }
     }
 
-    private fun createCandidateView(text: String, isPrimary: Boolean = false, onClick: () -> Unit): TextView {
+    private fun createCandidateView(text: String, isPrimary: Boolean = false,
+                                    onClick: () -> Unit,
+                                    onLongClick: (() -> Unit)? = null): TextView {
         return TextView(this).apply {
             this.text = text
             textSize = 16f
@@ -1121,6 +1137,15 @@ class PersonalIMEService : InputMethodService() {
             setOnClickListener {
                 feedbackManager.vibrate(vibrationStrength)
                 onClick()
+            }
+            // 长按候选 = 删自造词（误学的词必须有出口）。仅 user_words 里的词可删，
+            // 基础词库是只读资产删不了——hasUserWord 挡在回调里，长按基础词无反应。
+            if (onLongClick != null) {
+                setOnLongClickListener {
+                    feedbackManager.vibrate(vibrationStrength)
+                    onLongClick()
+                    true
+                }
             }
         }
     }
@@ -1145,14 +1170,14 @@ class PersonalIMEService : InputMethodService() {
         currentInputConnection?.commitText(candidate.text, 1)
         if (!isPrivacyMode) {
             if (candidate.components.isNotEmpty()) {
-                // 整句候选：components 存各组成词的拼音，逐词学习；
-                // 同时把整句作为新词入库（用户组词能力），下次直接命中置顶。
-                // 限长 2~8 字：单字无组词意义，超长串避免误学垃圾组合。
+                // 整句候选：components 存各组成词的拼音，逐词学习偏好。
+                // **整句本身不入 user_words**（2026-10-02 移除）：
+                // 整句是引擎 DP 拼的第一候选，用户选它多半是"被迫"——想打的词不在库里，
+                // 只能选排最前的整句凑合。把被迫的选择学成 -2000 永久霸榜词，
+                // 会让误拼的串从此压过一切（富者愈富），且用户毫无感知。
+                // 用户真正的组词意图体现在 appendLearnBuffer 的逐字选择里，那里才入库。
                 candidate.components.forEachIndexed { i, py ->
                     candidate.componentWords.getOrNull(i)?.let { pinyinEngine.learnSelection(py, it) }
-                }
-                if (candidate.text.length in 2..8) {
-                    pinyinEngine.addUserWord(candidate.pinyin, candidate.text)
                 }
             } else if (candidate.pinyin.isNotEmpty()) {
                 // 普通候选：按拼音+词条学习（只按拼音会连带抬高高同音词，如「你好」抬起「昵好」）
@@ -1168,9 +1193,15 @@ class PersonalIMEService : InputMethodService() {
 
     /**
      * 连续上屏组词学习：把本次上屏追加到学习缓冲，累计 >=2 字时将整串作为新词入库。
-     * 只收纯中文、拼音完整的普通候选（整句候选已由 commitCandidate 的整句分支入库，不重复入库）；
+     * 只收纯中文、拼音完整的普通候选（整句候选不入库，见 commitCandidate 注释）；
      * 总长超 8 字时丢弃旧缓冲重新累计，避免学进垃圾长串。
-     * 新词起始词频 60：能进候选但不抢位；再次选中即升入用户保护档，误学词自然沉淀。
+     * user_words 词以 USER_WORD_LOGP(-2000 纳特) 入库：高于基础词库全部词条——
+     * 用户亲手逐字打出来的词就是最想要的词；误学可用长按候选删除。
+     *
+     * 2026-10-02：**新词首次入库时 Toast 提示**。自造词此前完全不可感知——
+     * 用户逐字打完一个词，词库悄悄记住了，但用户不知道，下次整词直出也不知道
+     * 是造词的功劳；反过来误学了也不知道去哪删。「可感知」是自造词机制能被
+     * 用户信任的前提（商业输入法全部有"已记住"提示）。
      */
     private fun appendLearnBuffer(candidate: PinyinEngine.Candidate) {
         if (isPrivacyMode) return
@@ -1185,7 +1216,13 @@ class PersonalIMEService : InputMethodService() {
         if (learnBuffer.sumOf { it.text.length } >= 2) {
             val word = learnBuffer.joinToString("") { it.text }
             val pinyin = learnBuffer.joinToString("'") { it.pinyin }
+            val existed = pinyinEngine.hasUserWord(word)
             pinyinEngine.addUserWord(pinyin, word)
+            if (!existed) {
+                android.widget.Toast.makeText(
+                    this, "已记住「$word」，下次可直接打出", android.widget.Toast.LENGTH_SHORT
+                ).show()
+            }
         }
     }
 
