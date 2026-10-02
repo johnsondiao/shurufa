@@ -139,6 +139,48 @@ def has_cjk(word):
     return any(CJK_LO <= ord(c) <= CJK_HI for c in word)
 
 
+# ---------------------------------------------------------------- 语言模型
+
+class BigramLM:
+    """
+    字符级 bigram：给「上一词末字 → 下一词首字」的边界打分（毫纳特）。
+
+    命中条件概率直接取表内值；未剪枝掉的组合用精确退避
+        ln P_uni(b) + ln(δ/(c(a)+δ))
+    两项分别来自 char_uni 的 logp / norm 列，因此退避不是近似。
+
+    center=True 时每个边界再减去 lm_meta.mean_logp（语料上边界对数概率的期望，
+    约等于负的字符熵）。这一步很关键：sum 形式的边界项会随分段数线性变负，
+    使「段数多的路径」被系统性压低，整句候选会被单词条挤空；中心化后该量
+    只表达「这个搭接比平均好多少」，不再隐含长度惩罚。
+    """
+
+    def __init__(self, path, center=False):
+        con = sqlite3.connect(path)
+        self.uni = {cp: (lp, nm) for cp, lp, nm
+                    in con.execute("SELECT cp, logp, norm FROM char_uni")}
+        self.bi = {(p, n): lp for p, n, lp
+                   in con.execute("SELECT prev, next, logp FROM bigram")}
+        self.meta = dict(con.execute("SELECT key, value FROM lm_meta"))
+        con.close()
+        self.center = center
+        self.mean_logp = int(self.meta.get("mean_logp", "0")) if center else 0
+
+    def raw(self, prev_ch, next_ch):
+        hit = self.bi.get((ord(prev_ch), ord(next_ch)))
+        if hit is not None:
+            return hit
+        u = self.uni.get(ord(next_ch))
+        if u is None:                 # 后字不在字符集，无信息
+            return None
+        n = self.uni.get(ord(prev_ch))
+        return u[0] + (n[1] if n else 0)
+
+    def score(self, prev_ch, next_ch):
+        v = self.raw(prev_ch, next_ch)
+        return None if v is None else v - self.mean_logp
+
+
 # 词库 schema 适配：旧 words(frequency 整数档位) / 新 base_words(logp 连续值)
 SCHEMA = {}
 
@@ -204,18 +246,26 @@ def simulate_input_t9(db, digits, candidate_limit=60):
     return [w for w, _ in ordered[:candidate_limit]]
 
 
-def simulate_sentence_candidates(db, digits, limit=3):
+def simulate_sentence_candidates(db, digits, limit=3, lm=None, beta=1000, sent_k=3,
+                                 seg_penalty=0):
     """
     复现 PinyinEngine.sentenceCandidates()：
-      含数字串切分为词库词条组合（覆盖全部输入），DP 保留每位置 K=3 条路径。
-      打分 score = 段均分（整数除法）+ 数字总长 n，降序；同分取段数少者。
+      含数字串切分为词库词条组合（覆盖全部输入），DP 保留每位置 K 条路径。
+
+      打分 = Σ 词 logp
+           + β · Σ 边界字符 bigram logp（毫纳特，已中心化时只表达相对优劣）
+           - 段数惩罚 · (段数 - 1)
+
+    长度偏好由 seg_penalty 单独控制；若把长度惩罚混进 bigram 权重，
+       β 就会同时调节「上下文强度」和「偏向长词程度」，无法独立调参。
+      无语言模型时退化为纯 Σ 词 logp。
       返回 segments>=2 的组合文本列表。
     """
     n = len(digits)
     if n < 4 or n > 16:
         return []
     t, s, o = SCHEMA["table"], SCHEMA["score"], SCHEMA["order"]
-    K, MAX_WORD_DIGITS, WORDS_PER_SUB = 3, 8, 6
+    K, MAX_WORD_DIGITS, WORDS_PER_SUB = sent_k, 8, 6
     cur = db.cursor()
     dp = [[] for _ in range(n + 1)]
     dp[0] = [(0, 0, "")]        # (segments, score, text)
@@ -235,6 +285,12 @@ def simulate_sentence_candidates(db, digits, limit=3):
                 for w, f in ws:
                     # logp 已是整数毫纳特，直接累加即可；旧整数档位原样累加
                     add = int(f)
+                    if j > 0:
+                        add -= seg_penalty
+                    if lm is not None and text:
+                        bs = lm.score(text[-1], w[0])
+                        if bs is not None:
+                            add += int(beta * bs) // 1000
                     paths.append((segs + 1, score + add, text + w))
         if is_logp:
             # 概率量纲：路径总分越高（越接近 0）越优；同分取段数少者（倾向整词）
@@ -285,6 +341,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=DEFAULT_DB)
     ap.add_argument("--corpus", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus.tsv"))
+    ap.add_argument("--lm", default=None, help="bigram.db 路径；给了才启用语言模型")
+    ap.add_argument("--beta", type=int, default=1000, help="bigram 权重（相对词 logp，1000=1.0）")
+    ap.add_argument("--sent-k", type=int, default=3, help="整句 DP 每位置保留路径数")
+    ap.add_argument("--seg-penalty", type=int, default=0,
+                    help="每多切一段扣多少毫纳特（长度偏好，与 bigram 权重解耦）")
     ap.add_argument("--out", default=None)
     ap.add_argument("--worst", type=int, default=25)
     args = ap.parse_args()
@@ -293,6 +354,13 @@ def main():
         print(f"[错误] 找不到数据库：{args.db}")
         return 1
 
+    lm = None
+    if args.lm:
+        if not os.path.exists(args.lm):
+            print(f"[错误] 找不到语言模型：{args.lm}")
+            return 1
+        lm = BigramLM(args.lm)
+
     phrase_table, char_table = load_pinyin_sources()
     corpus = load_corpus(args.corpus)
     db = sqlite3.connect(args.db)
@@ -300,7 +368,14 @@ def main():
     total_rows = db.execute(f"SELECT COUNT(*) FROM {SCHEMA['table']}").fetchone()[0]
 
     print(f"词条拼音 {len(phrase_table)} 条 ｜ 单字拼音 {len(char_table)} 条 ｜ "
-          f"语料 {len(corpus)} 条 ｜ 词表 {SCHEMA['table']}({SCHEMA['score']}) {total_rows} 条\n")
+          f"语料 {len(corpus)} 条 ｜ 词表 {SCHEMA['table']}({SCHEMA['score']}) {total_rows} 条")
+    if lm is None:
+        print("语言模型：未启用")
+    else:
+        print(f"语言模型：字符 bigram {len(lm.bi)} 条 / unigram {len(lm.uni)} 条"
+              f" ｜ β={args.beta/1000:.2f} ｜ DP-K={args.sent_k}"
+              f" ｜ 段罚={args.seg_penalty/1000:.2f} 纳特")
+    print()
 
     results, skipped = [], []
     for word, domain, priority, kind in corpus:
@@ -311,7 +386,8 @@ def main():
         digits = to_digits(py)
         # 两条真实上屏路径都跑：用户不关心候选是哪条路径给出的，能选中就是好
         wc = simulate_input_t9(db, digits)
-        sc = simulate_sentence_candidates(db, digits)
+        sc = simulate_sentence_candidates(db, digits, lm=lm, beta=args.beta,
+                                          sent_k=args.sent_k, seg_penalty=args.seg_penalty)
         rw = wc.index(word) + 1 if word in wc else None
         rs = sc.index(word) + 1 if word in sc else None
         found = [x for x in (rw, rs) if x]

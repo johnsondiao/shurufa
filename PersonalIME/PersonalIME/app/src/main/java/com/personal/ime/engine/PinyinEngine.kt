@@ -140,8 +140,17 @@ class PinyinEngine(private val database: DictionaryDatabase) {
      * ## 打分（相对旧版的关键变化）
      * 旧版 `score/segments + n`（n = 输入数字长度）是个纯凑参数的启发式：
      * 两条路径的分数不可比，且随输入长度漂移。
-     * 新版改成**累加对数概率**——`Σ logp(词)` 就是该切分方案的对数概率，
-     * 不同切分覆盖同一串数字，因此可直接比较。这也是启用 bigram 的前置条件。
+     * 新版改成**累加对数概率**，三项都是"对数概率"量纲，可直接相加：
+     *
+     *     Σ logp(词)                     —— 语言先验（词有多常用）
+     *   + β · Σ bigram(前词末字, 后词首字)  —— 上下文（这个搭接顺不顺），已中心化
+     *   - 段罚 · (段数 - 1)              —— 切分偏好（偏向更少更长的词）
+     *
+     * 拆成三项而不是揉进一个权重，是为了可独立调参：
+     * 早期把长度偏好隐含在 bigram 的未中心化求和里，结果「上下文强度」和
+     * 「偏向长词程度」被同一个 β 绑死，无法单独调。
+     *
+     * 不同切分覆盖同一串数字，因此分数可直接比较——这也是能启用 bigram 的前提。
      */
     fun sentenceCandidates(digits: String, limit: Int = 3): List<Candidate> {
         // 分词键（'）切出强制音节边界：整句切分的词边界必须落在这些位置上
@@ -177,12 +186,22 @@ class PinyinEngine(private val database: DictionaryDatabase) {
                 val words = database.queryExact(plain.substring(j, i), WORDS_PER_SUB)
                 if (words.isEmpty()) continue
                 for (prev in prevList) {
+                    // 首个词没有左邻字：既无边界项，也不计段罚
+                    val isFirst = prev.segments == 0
                     for (w in words) {
                         if (w.word.none { it in '\u4E00'..'\u9FFF' }) continue
+                        var add = w.score
+                        if (!isFirst) {
+                            add -= LM_SEG_PENALTY
+                            // 语言模型未就绪时返回 null：跳过该项，视为"无上下文信息"
+                            database.bigramScore(prev.text.last(), w.word.first())?.let {
+                                add += Math.floorDiv(it * LM_BETA_PER_MILLE, 1000)
+                            }
+                        }
                         paths.add(
                             Path(
                                 prev.segments + 1,
-                                prev.score + w.score,
+                                prev.score + add,
                                 prev.text + w.word,
                                 if (prev.pinyin.isEmpty()) w.pinyin else prev.pinyin + "'" + w.pinyin,
                                 prev.components + w.pinyin,
@@ -432,7 +451,20 @@ class PinyinEngine(private val database: DictionaryDatabase) {
         private const val MAX_PINYIN_LEN = 6
 
         /** 整句 DP：每个位置保留的路径数上限 */
-        private const val K = 3
+        private const val K = 8
+
+        /**
+         * bigram 权重（×1000）。0.6 是在 473 条评测语料上扫出来的平台期取值：
+         * 再大开始被偶发共现带偏，再小上下文几乎不起作用。
+         */
+        private const val LM_BETA_PER_MILLE = 600
+
+        /**
+         * 段罚（毫纳特）：每多切一段扣 1.5 纳特，偏向更长（更少段）的切分。
+         * 与 bigram 权重分离，因为「上下文强度」和「偏向长词程度」是两件事。
+         * 语言模型缺失时此项仍然生效——它本身是个合理的切分先验。
+         */
+        private const val LM_SEG_PENALTY = 1500
 
         /** 整句 DP：单词数字长上限（涵盖绝大多数 2-4 字词） */
         private const val MAX_WORD_DIGITS = 8

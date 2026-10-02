@@ -117,7 +117,8 @@ class PersonalIMEService : InputMethodService() {
         clipboardManager = ClipboardManager(this)
         feedbackManager = FeedbackManager(this)
 
-        // 后台预热词库（首次安装需导入 40 万条资产词条）
+        // 后台预热：基础词库随包分发（首次仅一次文件拷贝），随后载入字符 bigram。
+        // 词库是离线构建好的成品，设备端不做逐行导入。
         serviceScope.launch(Dispatchers.IO) {
             database.warmUp()
         }

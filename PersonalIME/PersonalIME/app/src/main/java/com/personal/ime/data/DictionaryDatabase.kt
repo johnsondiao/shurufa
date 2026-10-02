@@ -14,7 +14,7 @@ import kotlin.math.ln
 import kotlin.math.pow
 
 /**
- * 词库数据层（v1，用户库 `ime_user.db` + 挂载只读基础库 `base_words.db`）
+ * 词库数据层（v1，用户库 `ime_user.db` + 挂载只读基础库 `base_words.db` + 语言模型 `bigram.db`）
  *
  * ## 相对旧版的结构性变化
  *
@@ -29,6 +29,9 @@ import kotlin.math.pow
  *   user_words（本文件，可写）—— 用户主动添加，**不衰减**
  *   user_pref （本文件，可写）—— 系统学出的偏好，**指数衰减**
  *
+ * 另有一个独立只读的**字符级 bigram**（bigram.db，见 [LanguageModel]），
+ * 给整句候选提供词间上下文，不做词频，只做「哪个字接哪个字更顺」。
+ *
  * ## 分数单位
  * 所有分数统一为 **毫纳特（natural log × 1000）的整数**，越大越优。
  * 基础词 logp 范围约 -26000 ~ -3000（离线流水线产出）。
@@ -36,7 +39,7 @@ import kotlin.math.pow
  *
  * ## 为什么不用 WAL
  * ATTACH 是**连接级**状态，而启用 WAL 会让 Android 使用连接池，
- * 池中其它连接看不到 `base` 别名，查询会报 `no such table: base.base_words`。
+ * 池中其它连接看不到 `base` / `lm` 别名，查询会报 `no such table: base.base_words`。
  * 未启用 WAL 时连接池大小为 1，ATTACH 安全。用户库写入量极小（每次上屏一条 upsert），
  * 不需要 WAL 的并发能力。
  */
@@ -45,20 +48,29 @@ class DictionaryDatabase(private val appContext: Context) :
 
     private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val baseDictionary = BaseDictionary(appContext)
+    private val languageModel = LanguageModel(appContext)
 
     @Volatile
     private var ready = false
 
     /** base 别名是否已挂到当前连接上 */
     @Volatile
-    private var attached = false
+    private var baseAttached = false
+
+    /** lm 别名是否已挂到当前连接上 */
+    @Volatile
+    private var lmAttached = false
 
     val isReady: Boolean get() = ready
+
+    /** 语言模型是否已载入内存（未就绪时整句排序退化为纯词频） */
+    val isLanguageModelReady: Boolean get() = languageModel.isLoaded
 
     override fun onConfigure(db: SQLiteDatabase) {
         super.onConfigure(db)
         // 刻意不调用 enableWriteAheadLogging()，原因见类注释（ATTACH 与连接池互斥）
-        attached = false
+        baseAttached = false
+        lmAttached = false
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -95,7 +107,7 @@ class DictionaryDatabase(private val appContext: Context) :
     }
 
     /**
-     * 后台预热：安装基础词库（首次约 25 MB 拷贝）+ 挂载。
+     * 后台预热：安装基础词库（首次约 25 MB 拷贝）+ 挂载，再载入语言模型。
      * 不在这里做任何数据导入——词库是离线构建好的成品文件。
      */
     fun warmUp() {
@@ -108,17 +120,37 @@ class DictionaryDatabase(private val appContext: Context) :
             ready = true
         } catch (e: Exception) {
             ready = false
+            return
+        }
+        // 语言模型是**增强项**：缺失或读取失败就退化为纯词频排序，不影响基础输入
+        try {
+            if (languageModel.ensureInstalled()) {
+                val database = writableDatabase
+                languageModel.attach(database)
+                languageModel.load(database)
+            }
+        } catch (e: Exception) {
+            // 保持未加载状态即可：boundaryScore 会返回 null，DP 自动跳过 bigram 项
         }
     }
 
     private fun attachIfNeeded(db: SQLiteDatabase) {
-        if (attached) return
-        try {
-            baseDictionary.attach(db)
-        } catch (e: SQLiteException) {
-            // 已挂载（重复 ATTACH 会抛错）——视为成功
+        if (!baseAttached) {
+            try {
+                baseDictionary.attach(db)
+            } catch (e: SQLiteException) {
+                // 已挂载（重复 ATTACH 会抛错）——视为成功
+            }
+            baseAttached = true
         }
-        attached = true
+        if (!lmAttached) {
+            try {
+                languageModel.attach(db)
+            } catch (e: SQLiteException) {
+                // 同上；也可能是语言模型资产缺失，此时 attach 内部已直接返回
+            }
+            lmAttached = true
+        }
     }
 
     /** 统一的取库入口：保证 base 已挂载 */
@@ -195,6 +227,17 @@ class DictionaryDatabase(private val appContext: Context) :
         val digits = toDigits(pinyin)
         return queryExact(digits, 60).firstOrNull { it.pinyin == pinyin }
     }
+
+    // ──────────────────────────────────────────────────────────── 语言模型
+
+    /**
+     * 词间边界分（毫纳特，越大越优）：上一词末字 → 下一词首字 的上下文偏好。
+     *
+     * @return null 表示语言模型未就绪，或后字不在模型字符集内（拉丁/生僻字）。
+     *         调用方必须**跳过**该项，不能记 0 分——记 0 等于认为"这个搭接很常见"，
+     *         会在模型缺失时反而偏爱长路径。
+     */
+    fun bigramScore(prev: Char, next: Char): Int? = languageModel.boundaryScore(prev, next)
 
     private fun query(where: String, args: Array<String>, digits: String, limit: Int): List<WordEntry> {
         val out = ArrayList<WordEntry>(limit)
