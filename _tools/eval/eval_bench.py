@@ -39,7 +39,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+# stdout 必须用 reconfigure 而不是再包一层 TextIOWrapper：
+# 被 import 时（校准分析要 import spearman），旧 wrapper 会被 GC 并连同
+# 底层 buffer 一起 close，新 wrapper 就撞 "I/O operation on closed file"。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+else:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 # 复用现有引擎复现（evaluate.py 的 main 有 __main__ 保护，可安全 import）
 # 必须在 import **之后**重新包一层 stdout：evaluate.py 模块级也做了一次

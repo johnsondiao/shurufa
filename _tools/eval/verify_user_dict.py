@@ -29,7 +29,13 @@ import sqlite3
 import sys
 import tempfile
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+# stdout 必须用 reconfigure 而不是再包一层 TextIOWrapper：
+# 被 import 时（校准分析要 import spearman），旧 wrapper 会被 GC 并连同
+# 底层 buffer 一起 close，新 wrapper 就撞 "I/O operation on closed file"。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+else:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))

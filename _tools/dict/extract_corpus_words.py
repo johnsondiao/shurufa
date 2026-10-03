@@ -147,7 +147,7 @@ def add_counts(counter, line):
 
 def add_counts_4gram(counter, line, seed3):
     """
-    pass2：只统计"左右两段都是高频 3-gram"的 4-gram。
+    pass2：只统计"**左或右**至少一段是高频 3-gram"的 4-gram。
 
     ## 为什么两遍扫描，而不是直接全量数 4-gram
 
@@ -159,12 +159,19 @@ def add_counts_4gram(counter, line, seed3):
     看网页语料 4-gram Top60，真词与跨词碎片几乎各一半：
         真词：人工智能(97) 脑机接口(69) 人民日报(66) 具身智能(33) 重要讲话(25)
         碎片：学习进行(54) 近平总(53) 机接口技(19) 国共产党(22)
-    区别很干净：**真词的两个 3-gram 重叠段本身也是高频**
+    区别很干净：**真词至少有一段本身就是高频**
         人工智能 = 人工智 + 工智能（都高频）
         学习进行 = 学习进 + 习进行（都不是高频 3-gram，直接不统计）
-        近平总   = 近平总 + 平总书（左边就不是高频，连候选都进不了）
-    所以"两个重叠 3-gram 都在高频集合里"这一条，就把碎片挡在计数之外——
-    不是事后过滤，是**根本不进候选池**，内存与噪声一起解决。
+
+    ## 为什么是"或"而不是"且"（2026-10-03 实测修正）
+
+    第一版要求左右**都**高频，漏杀严重：「量产」= 能量产 + 量产汽，
+    右边「量产汽」在语料里罕见 → 被判为碎片丢掉，结果 logp 只有 -27366，
+    而网页里它出现 21 次（属于常用词）。校准分析显示 4 字词的
+    "模型分 vs 真实频次分"秩相关只有 **0.094**——基本是噪声，
+    根因就是大量真词根本没进 4-gram 通道，只能靠字符模型兜底。
+    改成"任一高频"后碎片仍有 3-gram 高频段约束，且这批词的 rank 靠后、
+    logp 极低，排不进首屏，噪声可控。
     """
     for seg in CJK.findall(line):
         n = len(seg)
@@ -291,8 +298,12 @@ def main() -> int:
     # ── pass2：受限统计 4-gram（只统计左右两段都是高频 3-gram 的，见函数 docstring）──
     seed3 = {w: n for w, n in freq[3].items() if n >= LONG_SEED}
     print(f"\n  pass2：4-gram 受限统计（种子 3-gram ≥{LONG_SEED} 的有 {len(seed3):,} 个）…")
+    # 4-gram 只扫 news + web：书面语（新闻/网页）里 4 字短语最有价值，
+    # 而 opensub(1.7 亿字影视字幕) 的 4-gram 绝大多数是翻译腔对白片段与专名，
+    # 数量巨大却少有通用词——扫它会把内存吃光、把配额占满。
+    fourgram_sources = sources
     f4 = collections.Counter()
-    for name, path in sources:
+    for name, path in fourgram_sources:
         if not os.path.exists(path):
             continue
         try:
