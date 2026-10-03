@@ -74,8 +74,11 @@ CJK = re.compile(r"[\u4e00-\u9fff]+")
 MIN_FREQ = 40        # 频次门槛：实测「好多了」在全语料 ~3.1k，「多了去了」~65，都远超
 MIN_FREQ3 = 100      # 3 字门槛：手写词表回归暴露出「开会了 118 / 发工资 115」这类词
                      # 证据在 100~300 之间，300 的门槛会漏；100 以下开始混入噪声
-NGRAMS = (2, 3)      # 只抽 2/3 字：4 字以上已有 cn_words(40 万词组) 覆盖
-MAX_KEEP2 = 50000    # 2/3 字**分池**配额。共用一个 4 万总池的教训：
+MIN_FREQ4 = 12       # 4 字门槛：4-gram 空间大、噪声多，门槛要比 3 字高
+NGRAMS = (2, 3)      # 2/3 字：全量计数
+LONG_SEED = 3        # 4 字候选的"种子"门槛：4-gram w 只有在 w[:3] 与 w[1:] 都是
+                     # 频次 ≥3 的 3-gram 时才计数（见 pass2 的"为什么两遍扫描"）
+MAX_KEEP2 = 50000    # 2/3/4 字**分池**配额。共用一个 4 万总池的教训：
                      # 2 字词频次≥40 的有 21 万条，把低频 2 字词全放进总池排序，
                      # 会把「差不多了(923 次)」「快好了(426 次)」这类真短语挤出 4 万名开外——
                      # 手写 248 词回归里它们恰好全缺。分池后 3 字短语不受 2 字长尾挤压。
@@ -84,6 +87,7 @@ MAX_KEEP2 = 50000    # 2/3 字**分池**配额。共用一个 4 万总池的教�
                      # 2 字池提到 5 万（覆盖到频次 ~130，救回「跑着 134 / 饺子 207」）。
                      # 体积代价 ~3 MB，验收看 build 产物大小与首屏命中率不跌破。
 MAX_KEEP3 = 80000
+MAX_KEEP4 = 50000
 
 
 def open_text_stream(path):
@@ -119,21 +123,58 @@ def open_text_stream(path):
             with tf.extractfile(best) as fh:
                 for line in io.TextIOWrapper(fh, encoding="utf-8", errors="ignore"):
                     yield line
-    else:
+    elif path.endswith(".gz"):
         with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                yield line
+    else:
+        # 纯文本语料（web_corpus.txt 由 fetch_web_corpus.py 抓取生成）
+        with open(path, encoding="utf-8", errors="ignore") as fh:
             for line in fh:
                 yield line
 
 
 def add_counts(counter, line):
-    """对一行里的每个中文连续段做 n-gram 计数（同时统计 4-gram 供边界判据用）。"""
+    """对一行里的每个中文连续段做 2/3-gram 计数（4-gram 走 pass2 的受限统计）。"""
     for seg in CJK.findall(line):
         n = len(seg)
-        for size in NGRAMS + (4,):
+        for size in NGRAMS:
             if n < size:
                 continue
             for i in range(n - size + 1):
                 counter[size][seg[i:i + size]] += 1
+
+
+def add_counts_4gram(counter, line, seed3):
+    """
+    pass2：只统计"左右两段都是高频 3-gram"的 4-gram。
+
+    ## 为什么两遍扫描，而不是直接全量数 4-gram
+
+    全量 4-gram 有 **3000 万种**（3-gram 才 1500 万），dict 装不下；
+    而按频次门槛事后过滤也没用——种类数已经炸了，内存先崩。
+
+    ## 为什么这个受限条件能挡住噪声
+
+    看网页语料 4-gram Top60，真词与跨词碎片几乎各一半：
+        真词：人工智能(97) 脑机接口(69) 人民日报(66) 具身智能(33) 重要讲话(25)
+        碎片：学习进行(54) 近平总(53) 机接口技(19) 国共产党(22)
+    区别很干净：**真词的两个 3-gram 重叠段本身也是高频**
+        人工智能 = 人工智 + 工智能（都高频）
+        学习进行 = 学习进 + 习进行（都不是高频 3-gram，直接不统计）
+        近平总   = 近平总 + 平总书（左边就不是高频，连候选都进不了）
+    所以"两个重叠 3-gram 都在高频集合里"这一条，就把碎片挡在计数之外——
+    不是事后过滤，是**根本不进候选池**，内存与噪声一起解决。
+    """
+    for seg in CJK.findall(line):
+        n = len(seg)
+        if n < 4:
+            continue
+        for i in range(n - 3):
+            a = seg[i:i + 3]
+            b = seg[i + 1:i + 4]
+            if seed3.get(a, 0) >= LONG_SEED and seed3.get(b, 0) >= LONG_SEED:
+                counter[seg[i:i + 4]] += 1
 
 
 def load_phrase_lexicon():
@@ -210,8 +251,10 @@ def main() -> int:
     # 里非词比例很高。实测「好多了」3.1k、「新冠肺」4.1k，两者量级相当，
     # 所以 3 字的门槛不能只靠频次，主要靠词组词典挡内部片段。
     ap.add_argument("--min-freq3", type=int, default=MIN_FREQ3)
+    ap.add_argument("--min-freq4", type=int, default=MIN_FREQ4)
     ap.add_argument("--max-keep2", type=int, default=MAX_KEEP2)
     ap.add_argument("--max-keep3", type=int, default=MAX_KEEP3)
+    ap.add_argument("--max-keep4", type=int, default=MAX_KEEP4)
     ap.add_argument("--out", default=OUT_TXT)
     args = ap.parse_args()
 
@@ -219,6 +262,9 @@ def main() -> int:
         ("news", os.path.join(CORPUS, "news300k.tar.gz")),
         ("spoken", os.path.join(CORPUS, "opensub2016.gz")),
         ("wiki", os.path.join(CORPUS, "wikimedia.gz")),
+        # 当代网页文本：现有语料是 2020 新闻 + 影视字幕 + 百科旧快照，
+        # 缺的正是当代新词（脑机接口/具身智能/闪充/智驾…）。由 fetch_web_corpus.py 生成。
+        ("web", os.path.join(CORPUS, "web_corpus.txt")),
     ]
 
     freq = collections.defaultdict(collections.Counter)
@@ -239,14 +285,26 @@ def main() -> int:
         top = {s: freq[s].most_common(3) for s in NGRAMS}
         print(f"  {name:<8} 行 {rows:>9,}  字符 {chars:>11,}  "
               f"用时 {time.time() - t0:5.1f}s")
-        for s in NGRAMS + (4,):
+        for s in NGRAMS:
             print(f"       {s}-gram 种类 {len(freq[s]):>9,}  头部 {top.get(s, [])[:3]}")
 
+    # ── pass2：受限统计 4-gram（只统计左右两段都是高频 3-gram 的，见函数 docstring）──
+    seed3 = {w: n for w, n in freq[3].items() if n >= LONG_SEED}
+    print(f"\n  pass2：4-gram 受限统计（种子 3-gram ≥{LONG_SEED} 的有 {len(seed3):,} 个）…")
+    f4 = collections.Counter()
+    for name, path in sources:
+        if not os.path.exists(path):
+            continue
+        try:
+            for line in open_text_stream(path):
+                add_counts_4gram(f4, line, seed3)
+        except Exception as e:
+            print(f"  [warn] {name} 4-gram 扫描中断：{e}")
+    print(f"  4-gram 候选 {len(f4):,} 种  头部 {f4.most_common(8)}")
+
     # ── 抽词：频次门槛 + 子串占比 + 词组词典内部片段过滤 ────────────────────
-    LONG_FREQ = 4
-    f4 = {w: n for w, n in freq[4].items() if n >= LONG_FREQ}
     f3 = {w: n for w, n in freq[3].items() if n >= max(args.min_freq, args.min_freq3)}
-    print(f"  4-gram(≥{LONG_FREQ}) {len(f4):>9,} 条   "
+    print(f"  4-gram(≥{args.min_freq4}) {sum(1 for v in f4.values() if v >= args.min_freq4):>9,} 条   "
           f"3-gram(≥{max(args.min_freq, args.min_freq3)}) {len(f3):>9,} 条")
 
     phrase_bad = load_phrase_lexicon()
@@ -262,6 +320,16 @@ def main() -> int:
         kept3.append((w, n))
     n3_kept = len(kept3)
 
+    # 4 字词：判据只有 频次门槛 + 词组词典（没有 5-gram 可做 inside 传播）。
+    # 噪声主要由 pass2 的种子条件挡掉了，剩余的真碎片 rank 靠后、logp 极低，
+    # 排不进首屏，只是占点体积。
+    kept4 = []
+    for w, n in f4.items():
+        if n < args.min_freq4 or w in phrase_bad:
+            continue
+        kept4.append((w, n))
+    n4_kept = len(kept4)
+
     kept2 = []
     for w, n in freq[2].items():
         if n < args.min_freq:
@@ -271,15 +339,17 @@ def main() -> int:
         kept2.append((w, n))
     n2_kept = len(kept2)
 
-    print(f"  通过判据：3 字 {n3_kept:,} 条 ｜ 2 字 {n2_kept:,} 条")
-    # 分池截断：2/3 字各自按频次取 top，互不挤压（教训见 MAX_KEEP2 注释）
-    kept3.sort(key=lambda kv: (-kv[1], kv[0]))
-    kept2.sort(key=lambda kv: (-kv[1], kv[0]))
+    print(f"  通过判据：4 字 {n4_kept:,} 条 ｜ 3 字 {n3_kept:,} 条 ｜ 2 字 {n2_kept:,} 条")
+    # 分池截断：各长度分别按频次取 top，互不挤压（教训见 MAX_KEEP2 注释）
+    for lst in (kept2, kept3, kept4):
+        lst.sort(key=lambda kv: (-kv[1], kv[0]))
     kept3 = kept3[: args.max_keep3]
     kept2 = kept2[: args.max_keep2]
-    kept = kept2 + kept3
+    kept4 = kept4[: args.max_keep4]
+    kept = kept2 + kept3 + kept4
     print(f"  收入：2 字 {len(kept2):,} (配额 {args.max_keep2:,}) ｜ "
-          f"3 字 {len(kept3):,} (配额 {args.max_keep3:,})")
+          f"3 字 {len(kept3):,} (配额 {args.max_keep3:,}) ｜ "
+          f"4 字 {len(kept4):,} (配额 {args.max_keep4:,})")
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
